@@ -182,6 +182,52 @@ class LedgerTest {
         assertEquals("INR 100 credited",emailBody(part){error("Unexpected attachment request")})
     }
 
+    @Test fun summaryLinesAndChildReplaySaveBothCreditsOnce() = runBlocking {
+        val first = "INR 450 credited. UTR TEST987655"
+        val second = "INR 650 credited. UTR ALPHABET"
+        val summary = android.app.Notification.Builder(app,"test").setGroup("sms")
+            .setGroupSummary(true).setStyle(android.app.Notification.InboxStyle()
+                .addLine(first).addLine(second)).build()
+        val child = android.app.Notification.Builder(app,"test").setContentText(first).build()
+        suspend fun post(n:android.app.Notification, key:String) {
+            for ((body, stamp, identity) in notificationEvents(n,"com.google.android.apps.messaging",key,1000L))
+                captureText(store,body,"Messages",identity,stamp)
+        }
+        post(summary,"summary")
+        post(child,"child")
+        post(summary,"summary")
+        post(android.app.Notification.Builder(app,"test").setContentText("I will call later").build(),"ordinary")
+        store.db.close()
+        store = open()
+        val credits = store.state().credits
+        assertEquals(2, credits.size)
+        assertEquals(mapOf("TEST987655" to 45000L,"ALPHABET" to 65000L),
+            credits.associate { it.reference to it.amount })
+        assertTrue(credits.none { it.confirmed })
+    }
+
+    @Test fun emptyMessagingBundleFallsBackToExpandedText() {
+        val body = "INR 450 credited. UTR TEST987655"
+        val n = android.app.Notification.Builder(app,"test").setContentText("New message")
+            .setStyle(android.app.Notification.BigTextStyle().bigText(body)).build()
+        n.extras.putParcelableArray(android.app.Notification.EXTRA_MESSAGES,arrayOf(android.os.Bundle()))
+        assertEquals(listOf(body), notificationEvents(n,"messages","child",10L).map { it.first })
+    }
+
+    @Test fun hiddenPreviewDoesNotFallBackToOtherExtras() {
+        val n = android.app.Notification.Builder(app,"test")
+            .setContentText("Sensitive notification content hidden")
+            .setStyle(android.app.Notification.BigTextStyle().bigText("INR 450 credited. UTR TEST987655"))
+            .build()
+        assertTrue(notificationEvents(n,"messages","child",10L).isEmpty())
+    }
+
+    @Test fun genericSummaryOffersNoTransaction() {
+        val n = android.app.Notification.Builder(app,"test").setGroup("sms").setGroupSummary(true)
+            .setContentText("2 new messages").build()
+        assertTrue(notificationEvents(n,"messages","summary",10L).isEmpty())
+    }
+
     @Test fun groupedUpdateReplaysOldMessageWithoutLosingNewOne()=runBlocking {
         val notification=android.app.Notification.Builder(app,"test").build()
         fun entry(text:String,t:Long)=android.os.Bundle().apply {

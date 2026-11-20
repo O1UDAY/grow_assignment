@@ -228,7 +228,7 @@ typealias Commit = (suspend () -> Unit) -> Unit
                     }
                     "access"->AccessForm(resumeTick,::say,{go("diagnostics")},{go("email")}) {
                         save {
-                            prefs(ctx).edit().putBoolean("paused",true).remove("eventTime").remove("eventSource").remove("outcome")
+                            prefs(ctx).edit().putBoolean("paused",true).remove("eventShape").remove("detailOutcome").remove("eventTime").remove("eventSource").remove("outcome")
                                 .remove("processingFailed").remove("testResult").remove("probe").apply()
                             store.deleteImports()
                         }

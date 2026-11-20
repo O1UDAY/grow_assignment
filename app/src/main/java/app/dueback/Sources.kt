@@ -30,7 +30,7 @@ internal fun listenerGranted(ctx:Context):Boolean {
         .split(':').any { ComponentName.unflattenFromString(it) == component }
 }
 
-private data class CaptureState(val granted:Boolean, val selected:Set<String>, val status:String,
+private data class CaptureState(val granted:Boolean, val connected:Boolean, val selected:Set<String>, val status:String,
     val time:Long, val source:String?, val outcome:String?)
 @Composable private fun captureState(resumeTick:Int):CaptureState {
     val ctx=LocalContext.current
@@ -44,7 +44,7 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
     return remember(resumeTick,change) {
         val granted=listenerGranted(ctx)
         val selected=installedSources(ctx).keys.filter {settings.getBoolean(it,false)}.toSet()
-        CaptureState(granted,selected,when {
+        CaptureState(granted,CaptureService.connected,selected,when {
             settings.getBoolean("paused",false) -> "Capture paused"
             granted && selected.isNotEmpty() && CaptureService.connected && settings.getBoolean("processingFailed",false) -> "Processing failed"
             else -> CapturePolicy.status(granted,selected.size,CaptureService.connected)
@@ -63,7 +63,7 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
     available.forEach { (pkg,label) ->
         val checked=pkg in state.selected
         Row(Modifier.fillMaxWidth().toggleable(checked,role=Role.Switch,onValueChange={
-            prefs(ctx).edit().putBoolean(pkg,it).apply()
+            prefs(ctx).edit().putBoolean(pkg,it).putString("label/$pkg",label).apply()
         }).heightIn(min=52.dp),verticalAlignment=Alignment.CenterVertically) {
             Column(Modifier.weight(1f)){Text(label);Text(pkg,style=MaterialTheme.typography.bodySmall)}; Switch(checked,null)
         }
@@ -120,13 +120,22 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
 @Composable fun Diagnostics(resumeTick:Int,manage:()->Unit) {
     val ctx=LocalContext.current
     val state=captureState(resumeTick)
-    BoxCard { Section("Android access");Text(if(state.granted)"Enabled" else "Off");Text(state.status) }
+    BoxCard {
+        Section("Android access")
+        Text(if (state.granted) "Access granted" else "Access denied")
+        Text(if (state.connected) "Listener connected" else "Listener disconnected")
+        Text(state.status)
+    }
     BoxCard { Section("Selected apps");Text(state.selected.mapNotNull {installedSources(ctx)[it]}.joinToString().ifBlank {"None selected"}) }
     BoxCard {
         Section("Last selected-app notification")
         if(state.time==0L) Text("No event received yet.") else {
             Text(state.source.orEmpty()+" · "+DateFormat.getDateTimeInstance().format(Date(state.time)))
+            prefs(ctx).getString("eventShape",null)?.let { Text(it) }
             Text(state.outcome.orEmpty())
+            if (prefs(ctx).getString("eventShape",null)?.startsWith("Group summary") == true && state.outcome?.startsWith("Saved for review") != true) {
+                prefs(ctx).getString("detailOutcome",null)?.let { Text("Previous processing result: $it") }
+            }
         }
     }
     Text("Only the source, time and result appear here. If no event arrives, check that the source app posts notifications with previews enabled.")

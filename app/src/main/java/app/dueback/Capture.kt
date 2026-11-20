@@ -9,6 +9,8 @@ import android.os.Build
 import android.service.notification.*
 import androidx.room.withTransaction
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.math.BigDecimal
 import java.security.MessageDigest
 import java.text.NumberFormat
@@ -91,23 +93,50 @@ internal fun notificationText(n: Notification): String {
         .joinToString("\n").take(12000)
 }
 
+private const val HIDDEN_PREVIEW = "sensitive notification content hidden"
+private val unavailablePreviews = setOf(HIDDEN_PREVIEW, "content hidden", "new message")
+
+private fun isUnavailablePreview(text: String): Boolean =
+    text.lowercase(Locale.ROOT) in unavailablePreviews
+
 internal fun notificationEvents(notification:Notification,pkg:String,notificationKey:String,instanceTime:Long):List<Triple<String,Long,String>> {
-    val messages=notification.extras?.getParcelableArray(Notification.EXTRA_MESSAGES)
-        .orEmpty().filterIsInstance<android.os.Bundle>()
-    val isSummary=notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
-    return when {
-        messages.isNotEmpty() -> messages.mapNotNull { bundle ->
-            val body=bundle.getCharSequence("text")?.toString()?.take(12000) ?: return@mapNotNull null
-            val stamp=bundle.getLong("time").takeIf {it>0} ?: instanceTime
-            val sender=bundle.getCharSequence("sender")?.toString().orEmpty()
-            Triple(body,stamp,digest("$pkg|$sender|$stamp|"+textKey(body)))
+    val extras = notification.extras ?: return emptyList()
+    val collapsed = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
+    if (collapsed.equals(HIDDEN_PREVIEW, ignoreCase = true)) return emptyList()
+    val messages = extras.getParcelableArray(Notification.EXTRA_MESSAGES).orEmpty()
+        .filterIsInstance<android.os.Bundle>().mapNotNull { bundle ->
+            val body = bundle.getCharSequence("text")?.toString()?.trim()?.take(12000)
+                ?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val stamp = bundle.getLong("time").takeIf { it > 0 } ?: instanceTime
+            val sender = bundle.getCharSequence("sender")?.toString().orEmpty()
+            Triple(body, stamp, digest("$pkg|$sender|$stamp|" + textKey(body)))
         }
-        isSummary -> emptyList()
-        else -> {
-            val body=notificationText(notification)
-            val stamp=notification.`when`.takeIf {it>0} ?: instanceTime
-            listOf(Triple(body,stamp,digest(notificationKey+"|"+instanceTime+"|"+textKey(body))))
+    if (messages.isNotEmpty()) return messages
+
+    val summary = notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
+    val stamp = notification.`when`.takeIf { it > 0 } ?: instanceTime
+    val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES).orEmpty()
+        .map { it.toString().trim().take(12000) }.filter { it.isNotEmpty() }
+    val previews = listOf(Notification.EXTRA_BIG_TEXT, Notification.EXTRA_TEXT)
+        .mapNotNull { extras.getCharSequence(it)?.toString()?.trim()?.take(12000) }
+        .filter { it.isNotEmpty() }
+    val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()?.take(12000)
+    val bodies = if (lines.isNotEmpty()) lines else {
+        // Keep the expanded version when both views are present. It may
+        // include qualifiers that are absent from the collapsed preview.
+        val preview = previews.firstOrNull { !isUnavailablePreview(it) }
+            ?: previews.firstOrNull()
+            ?: title?.takeIf { Rules.parse(it).kind != Rules.Kind.IGNORE }
+        listOfNotNull(preview)
+    }
+    return bodies.mapNotNull { body ->
+        if (summary) {
+            // Without a message timestamp or reference, a summary cannot be
+            // reconciled safely with its children.
+            val parsed = Rules.parse(body)
+            if (parsed.kind == Rules.Kind.IGNORE || parsed.reference.isBlank()) return@mapNotNull null
         }
+        Triple(body, stamp, digest(notificationKey + "|" + instanceTime + "|" + textKey(body)))
     }
 }
 
@@ -118,6 +147,7 @@ class CaptureService: NotificationListenerService() {
     }
     private val worker = java.util.concurrent.Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + worker)
+    private val processing = Mutex()
     override fun onListenerConnected() { super.onListenerConnected(); connected = true; signal() }
     override fun onListenerDisconnected() { connected = false; signal(); super.onListenerDisconnected() }
     private fun signal() { prefs(this).edit().putLong("connection", android.os.SystemClock.elapsedRealtimeNanos()).apply() }
@@ -139,45 +169,66 @@ class CaptureService: NotificationListenerService() {
             return
         }
         if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) return
-        val source=installedSources(this)[pkg] ?: return
+        val source=settings.getString("label/$pkg",null) ?: pkg
         val time=System.currentTimeMillis()
         val instanceTime=activePosts.getOrPut(sbn.key) { sbn.postTime }
         scope.launch {
-            if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) return@launch
-            var failed=false
-            val outcome=try {
-                val notification=sbn.notification
-                val isSummary=notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
-                val inputs=notificationEvents(notification,pkg,sbn.key,instanceTime)
-                val store=Store(Ledger.get(this@CaptureService))
-                var saved=0
-                var duplicates=0
-                for((body,stamp,key) in inputs) {
-                    if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) break
-                    val result=store.db.withTransaction {
-                        if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) NO_TRANSACTION
-                        else captureText(store,body,source,key,stamp)
+            processing.withLock {
+                if (!connected || !listenerGranted(this@CaptureService) ||
+                    settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) return@launch
+                val summary = sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
+                var inputCount = 0
+                var failed=false
+                var stage = "extract preview"
+                val outcome=try {
+                    val notification=sbn.notification
+                    val inputs=notificationEvents(notification,pkg,sbn.key,instanceTime)
+                    inputCount = inputs.size
+                    stage = "open ledger"
+                    val store=Store(Ledger.get(this@CaptureService))
+                    var saved=0
+                    var duplicates=0
+                    for((body,stamp,key) in inputs) {
+                        if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) break
+                        stage = "parse and store"
+                        val result=store.db.withTransaction {
+                            if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) NO_TRANSACTION
+                            else captureText(store,body,source,key,stamp)
+                        }
+                        when(result){
+                            DUPLICATE -> duplicates++
+                            NO_TRANSACTION -> Unit
+                            else -> saved++
+                        }
                     }
-                    when(result){
-                        DUPLICATE -> duplicates++
-                        NO_TRANSACTION -> Unit
-                        else -> saved++
+                    when {
+                        saved>0 -> {
+                            runCatching { deliver(this@CaptureService,"New items are ready to review.") }
+                            "Saved for review: $saved"
+                        }
+                        duplicates>0 -> DUPLICATE
+                        summary && inputs.isEmpty() -> {
+                            "Skipped group summary: no identifiable message."
+                        }
+                        inputs.isEmpty() || inputs.all { isUnavailablePreview(it.first) } ->
+                            "Preview unavailable or hidden. Share or paste the message."
+                        else -> NO_TRANSACTION
                     }
+                } catch(e:CancellationException){throw e}
+                  catch(e:Exception){failed=true; "Processing failed at $stage. Share the message or import the statement."}
+                if (settings.getLong("eventTime",0)>time) return@launch
+                val shape = if (summary) "Group summary" else "Individual notification"
+                if (BuildConfig.DEBUG) android.util.Log.d("DueBackCapture",
+                    "$shape received; $inputCount previews; $outcome")
+                val edit = settings.edit().putLong("eventTime",time).putString("eventSource",source)
+                    .putString("outcome",outcome)
+                    .putString("eventShape", "$shape · extracted previews: $inputCount")
+                if (!summary || failed || outcome.startsWith("Saved for review")) {
+                    edit.putBoolean("processingFailed",failed)
+                        .putString("detailOutcome","$source · $outcome")
                 }
-                when {
-                    saved>0 -> { deliver(this@CaptureService,"New items are ready to review."); "$saved ready for review" }
-                    duplicates>0 -> DUPLICATE
-                    isSummary && inputs.isEmpty() -> "Group summary. Waiting for individual messages."
-                    notification.extras?.getCharSequence(Notification.EXTRA_TEXT).isNullOrBlank() &&
-                        notification.extras?.getCharSequence(Notification.EXTRA_BIG_TEXT).isNullOrBlank() ->
-                        "No supported transaction. Preview missing or limited to a title."
-                    else -> NO_TRANSACTION
-                }
-            } catch(e:CancellationException){throw e}
-              catch(e:Exception){failed=true; "Processing failed. Share the message or import the statement."}
-            if (settings.getLong("eventTime",0)>time) return@launch
-            settings.edit().putLong("eventTime",time).putString("eventSource",source)
-                .putBoolean("processingFailed",failed).putString("outcome",outcome).apply()
+                edit.apply()
+            }
         }
     }
 }

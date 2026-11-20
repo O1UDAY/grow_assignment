@@ -5,6 +5,15 @@ import static org.junit.Assert.*;
 import java.util.Arrays;
 
 public class RulesTest {
+    @Test public void smsFixturesRetainAmountAndReference() {
+        for (String[] fixture : new String[][] {{"450", "TEST987655"}, {"650", "ALPHABET"}}) {
+            Rules.Parsed credit = Rules.parse("INR " + fixture[0] + " credited. UTR " + fixture[1]);
+            assertEquals(Rules.Kind.CREDIT, credit.kind);
+            assertEquals(fixture[0], credit.amount);
+            assertEquals(fixture[1], credit.reference);
+        }
+    }
+
     @Test public void threeRefundCredits() {
         long total=Rules.paise("1,200");
         long bank=Rules.paise("900"), wallet=Rules.paise("200");

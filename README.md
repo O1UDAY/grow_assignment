@@ -33,14 +33,118 @@ The distributed source defaults to **Account connection unavailable**. To enable
 
 ## Build and install
 
-Use JDK 17, Android SDK Platform 35 and Build Tools 34.0.0. Point ANDROID_HOME at the SDK or set sdk.dir in local.properties. The first build needs access to GitHub, Gradle, Google Maven and Maven Central. On Windows, from the folder containing settings.gradle.kts:
+DueBack uses JDK 17, Gradle 8.9 via the wrapper, Android Gradle Plugin 8.7.3, SDK
+Platform 35 and Build Tools 34.0.0. The debug APK supports Android 8.0 and newer.
+The first build needs access to GitHub, Gradle's distribution host, Google Maven
+and Maven Central.
 
-```powershell
-.\gradlew.bat --continue testDebugUnitTest lintDebug assembleDebug
-adb install -r .\app\build\outputs\apk\debug\app-debug.apk
+### Linux Mint or Ubuntu on x86-64
+
+Install missing prerequisites. The first two commands require sudo on your Linux system.
+Reuse the current SDK and command-line tools if already installed. Set
+ANDROID_HOME to their actual path, or use the default below.
+
+```bash
+sudo apt update
+sudo apt install openjdk-17-jdk ca-certificates curl unzip perl
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+java -version
 ```
 
-On Linux or macOS use `bash gradlew --continue testDebugUnitTest lintDebug assembleDebug`. Pushing this revision to main triggers the included GitHub workflow. To run it again, use **Actions → Build DueBack APK → Run workflow**. A successful run uploads **DueBack-debug**, containing DueBack-review-debug.apk and its verified signing-certificate report. The APK supports Android 8.0 and later.
+If sdkmanager is missing, review the license at the [official Android SDK tools page](https://developer.android.com/studio#command-line-tools-only).
+Use the pinned official download below. This block stages files in a temporary
+directory and uses a fresh numbered location inside the SDK for the tools.
+
+```bash
+(
+  set -eu
+  android_cli_dir="$ANDROID_HOME/cmdline-tools/15859902"
+  if command -v sdkmanager >/dev/null || [ -x "$android_cli_dir/bin/sdkmanager" ]; then
+    exit 0
+  fi
+  test ! -e "$android_cli_dir"
+  android_download="$(mktemp -d)"
+  cd "$android_download"
+  curl --fail --location --show-error --output cli.zip \
+    https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip
+  echo '4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  cli.zip' | sha256sum -c -
+  unzip -q cli.zip
+  mkdir -p "$ANDROID_HOME/cmdline-tools"
+  mv cmdline-tools "$android_cli_dir"
+)
+if ! command -v sdkmanager >/dev/null; then
+  export PATH="$ANDROID_HOME/cmdline-tools/15859902/bin:$PATH"
+fi
+
+# Review and accept the applicable licenses at the prompts.
+sdkmanager --sdk_root="$ANDROID_HOME" --licenses
+sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;34.0.0" "emulator"
+sdkmanager --sdk_root="$ANDROID_HOME" \
+  "system-images;android-35;google_apis_playstore;x86_64" \
+  "system-images;android-33;google_apis_playstore;x86_64"
+```
+
+From the directory containing gradlew, create a local SDK pointer if one
+doesn't exist. If it exists, inspect its sdk.dir and edit it only if it points
+at a different SDK. The wrapper downloads the official 8.9 JAR when missing
+and checks its pinned SHA-256 before launch. The distribution hash is pinned
+in gradle/wrapper/gradle-wrapper.properties.
+
+```bash
+if [ ! -e local.properties ]; then
+  printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+fi
+bash gradlew --no-daemon --max-workers=2 --continue testDebugUnitTest lintDebug assembleDebug
+apk=app/build/outputs/apk/debug/app-debug.apk
+"$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs "$apk"
+```
+
+On Windows, point JAVA_HOME to JDK 17 and set ANDROID_HOME or sdk.dir. Then run
+`gradlew.bat --no-daemon --max-workers=2 --continue testDebugUnitTest lintDebug assembleDebug`.
+The GitHub workflow runs those Gradle tasks on Linux and uploads
+**DueBack-debug**, containing **DueBack-capture-debug.apk** and the
+apksigner report, after all checks pass.
+
+### Start the emulator and install
+
+Run the builds first. Close each emulator before starting the next one to
+limit memory usage. Reuse your existing Google Play AVD where available.
+Check hardware virtualization with `emulator -accel-check`. If KVM is missing
+on Mint or Ubuntu, install it with `sudo apt install qemu-kvm` and use an
+account with permission to access /dev/kvm.
+
+```bash
+avdmanager list avd
+# Create these only if they don't already exist.
+avdmanager create avd -n DueBack_API35 -k "system-images;android-35;google_apis_playstore;x86_64"
+avdmanager create avd -n DueBack_API33 -k "system-images;android-33;google_apis_playstore;x86_64"
+emulator -avd DueBack_API35 -memory 2048 -no-snapshot-load
+```
+
+In another terminal, with the same PATH configuration, wait for the Android
+home screen and then run:
+
+```bash
+adb wait-for-device
+adb shell getprop ro.build.version.sdk
+adb shell pm path com.google.android.apps.messaging
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n app.dueback/.MainActivity
+```
+
+If Google Messages is absent, install it through Play Store and set it as
+the default SMS app. Allow its own notifications and keep its conversation
+closed. Repeat with the API 33 AVD after running `adb emu kill` on API 35.
+
+### Test on your phone
+
+1. Verify the APK's signature using the command above. Install with `adb install -r PATH_TO_APK` after enabling USB debugging and authorizing your computer, or tap the APK on your phone and allow installation from that source. An update requires the same signing certificate as the existing app. If certificates differ, rebuild with the original signing key to preserve the installed app and its data.
+2. In DueBack open **Sources**, enable notification access in Android settings, select **Messages**, and resume capture if paused. Allow notifications and previews in Messages. Leave the conversation closed. DueBack's own alerts are optional.
+3. Ask a second phone to send a synthetic SMS such as `INR 450 credited. UTR TEST987655`. Use a fresh reference on each independent run. First confirm that Messages posted the notification in Android's shade.
+4. Open **Sources > View capture diagnostics** and verify access, listener status, event time and processing result. In **Payments**, verify one unconfirmed INR 450 entry with reference TEST987655 and no increase in received totals. Reopen the app and check it persists.
+5. On Android 13 and newer, sideloaded apps may require **Settings > Apps > DueBack > More > Allow restricted settings** if that option is available. If unavailable, share or paste a message into DueBack or enter the payment manually.
 
 ## Reviewing and deleting imports
 
@@ -50,16 +154,75 @@ Calendar-day estimates use the original timestamp and zone. Business-day promise
 
 Under Sources, Pause capture stops processing new selected-app notifications. Delete imported data asks for confirmation, pauses capture, removes imports and related matches, clears duplicate markers and activity history, and keeps manual entries, groups and bills. Existing v1 refunds whose origin was not recorded are retained.
 
-## What to verify on a device
+## How automatic capture works
 
-- Skip onboarding or deny access. Add a refund manually, share text, and import a CSV. Return to Sources and grant, revoke and re-grant access. Check that the status refreshes each time.
-- Open Sources → Capture diagnostics → Run listener test. Enable DueBack alerts only if you want to post the test notification. A pass confirms delivery through Android and recognition of the labelled INR 12.34 fixture. It creates no ledger entry. Then test your actual source app separately.
-- If access is granted but the listener is disconnected, tap Reconnect listener. If Android still does not bind it, toggle DueBack in Android notification-access settings. On supported Android versions, a trusted sideloaded APK may show Allow restricted settings under DueBack app info → More. Manual entry remains available.
-- Post a fresh ordinary message from a selected app. Check that diagnostics changes from “No event received yet” to “No supported transaction found”. A post from an unselected app should leave the last event unchanged.
-- With Google Messages selected, receive a test SMS reading `INR 250 credited. UTR: TEST123456`. An emulator can receive it via `adb emu sms send 5551234 "INR 250 credited. UTR: TEST123456"`. Enable message previews and leave the conversation closed. Check for a single unconfirmed payment in DueBack. The SMS app must post a notification.
-- Import a CSV with `amount,type,utr` followed by `250,credit,TEST123456`. Verify only one payment remains. Two different references for the same amount represent different credits. Overlapping unreferenced observations require review.
-- Deny DueBack activity alerts and repeat. Confirm that ledger updates still appear in the app. Try the forms with a keyboard, large text and a narrow screen.
+Sources stores an explicit package selection. Android grants listener access
+separately and calls the listener when connected. Each new notification post
+is checked against the selected package and pause setting. A second package
+discovery lookup is unnecessary and previously could drop a selected event
+before diagnostics.
+
+The previous extractor discarded summaries without MessagingStyle bundles,
+even when those summaries included readable text lines. Unreadable message
+bundles could also suppress a valid expanded preview. DueBack now reads
+MessagingStyle entries, inbox lines, expanded text and ordinary previews.
+For previews that exist only on a summary, a transaction reference lets
+DueBack reconcile the summary with child events. Generic summaries are
+skipped and their diagnostic results preserve the previous processed result.
+This fixes observable code paths. The original Google Messages event payloads
+and reason for the historical failure remain unverified.
+
+The parser receives each extracted message's timestamp. Room checks repeated
+event identities and payment references before writing. Payments appear in
+review via the ledger's Room change flow. The Payments summary counts only
+confirmed credits. Repeated unreferenced details presented in different
+formats without a stable identity may still require manual review.
+
+## Testing real SMS capture on an emulator
+
+Set up Sources and Messages as in the phone steps. Use an emulator with
+only synthetic test data. Leave the notifications in the shade so the next SMS
+can update or group them. Confirm each post in the shade before reading the
+DueBack result.
+
+```bash
+adb emu sms send 5551234 "INR 450 credited. UTR TEST987655"
+adb emu sms send 5551234 "INR 650 credited. UTR ALPHABET"
+adb emu sms send 5551235 "INR 450 credited. UTR TEST987655"
+adb emu sms send 5551234 "I will call later"
+adb logcat -d -s DueBackCapture:D
+```
+
+| Check | Expected result |
+| --- | --- |
+| First fresh SMS | One unconfirmed payment, INR 450 and TEST987655 |
+| Same conversation and another sender | Two payments total, with INR 650 and ALPHABET on the second payment |
+| Repeat reference and ordinary SMS | No extra payment and no change in received totals |
+| Deselect Messages and send another fresh credit | No entry. Reselect it, pause capture and repeat using a new reference |
+| Revoke Android notification access and open DueBack | Access denied and manual entry available. Restore access and confirm a fresh SMS is processed after reconnecting |
+| Force stop and reopen DueBack | Captured records persist. Use Reconnect listener if the service needs rebinding |
+
+Diagnostics log only the event shape, number of usable inputs and outcome.
+If the latest event is an empty summary, look at the previous processing
+result as well. Android 15 redacts notifications it classifies as containing
+an OTP for untrusted listeners. A missing preview can also be caused by the
+source app. DueBack cannot determine the cause from an empty payload.
+Notification access only exposes what Android supplies in posted
+notifications. Share text or enter the payment manually if the preview is
+unavailable. See the [Android 15 behavior changes](https://developer.android.com/about/versions/15/behavior-changes-all#otp-redaction)
+and the [notification listener reference](https://developer.android.com/reference/android/service/notification/NotificationListenerService).
 
 ## Verification of this revision
 
-All 14 standalone Java parser, accounting and notification-policy tests passed locally. The Gradle invocation for testDebugUnitTest, lintDebug and assembleDebug stopped during wrapper download because the build host could not resolve raw.githubusercontent.com. The production v2→v3 SQL ran against a populated SQLite fixture. Every original value in all nine tables, the payment indices and the outstanding balance survived. No Android SDK, emulator or adb installation was found. The Room/Robolectric and notification-extraction tests, UI, OAuth consent, device capture and APK installation remain unverified. The GitHub workflow is provided but has not run for this revision.
+| Check | Observed result |
+| --- | --- |
+| Standalone Java tests | 15 passed, including both SMS parser fixtures |
+| Gradle unit tests, lint and APK | Attempted on Windows. Wrapper download blocked by DNS resolution for raw.githubusercontent.com. Robolectric and Android build tasks did not start |
+| APK signature | No APK built to verify |
+| API 35 and API 33 Google Messages | Unverified. This environment had no adb, Android SDK or emulator, and WSL returned access denied |
+| Physical phone | Unverified |
+
+The Linux setup and emulator commands above are instructions for the target
+machine. The Windows command attempted here was
+`gradlew.bat --max-workers=2 --continue testDebugUnitTest lintDebug assembleDebug`
+with JAVA_HOME set to an installed JDK 17.

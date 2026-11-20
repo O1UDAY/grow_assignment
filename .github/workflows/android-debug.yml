@@ -19,6 +19,16 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;34.0.0'
       - run: bash gradlew --no-daemon --continue testDebugUnitTest lintDebug assembleDebug
+      - name: Save lint and test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DueBack-verification-reports
+          path: |
+            app/build/reports/lint-results-debug.*
+            app/build/intermediates/lint_intermediate_text_report/debug/**/lint-results-debug.txt
+            app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: ignore
       - name: Verify signature and name APK
         run: |
           mkdir -p deliverables

@@ -199,14 +199,14 @@ typealias Commit = (suspend () -> Unit) -> Unit
                         Text(originalDate(c.sourceTime,c.sourceZone))
                         if(data.allocations.none {it.credit==c.id}) Text("No allocation. This payment has not settled a balance.")
                         if(c.payer.isNotBlank()) Text("From "+c.payer)
-                                    if(c.destination.isNotBlank()) Text("Received in "+c.destination)
-                                    c.reference?.let {Text("Transaction ID "+it)}
-                                    if(c.orderRef.isNotBlank()) Text("Order "+c.orderRef)
-                                    if(!c.confirmed){ Text(if(data.credits.any {it.id!=c.id && it.amount==c.amount}) "Another payment has this amount. Confirm only if your statement shows a separate credit." else "Check your statement before confirming this credit.");ActionRow{Link("Confirm credit"){save {store.review(c,true)}};Link("Dismiss"){save {store.review(c,false)}}} }
-                                    else if(data.free(c)>0){Text(money(data.free(c))+" available");Link(if(data.candidates(c).size>1)"Choose bill or refund" else "Allocate"){go("match",c.id)}}
-                                    data.allocations.filter {it.credit==c.id}.forEach {a->
-                                        Text(money(a.amount)+" → "+data.label(data.dues.first {it.id==a.due}));Text(a.reason,style=MaterialTheme.typography.bodySmall);Link("Undo match"){save {store.undo(a)}}
-                                    }
+                        if(c.destination.isNotBlank()) Text("Received in "+c.destination)
+                        c.reference?.let {Text("Transaction ID "+it)}
+                        if(c.orderRef.isNotBlank()) Text("Order "+c.orderRef)
+                        if(!c.confirmed){ Text(if(data.credits.any {it.id!=c.id && it.amount==c.amount}) "Another payment has this amount. Confirm only if your statement shows a separate credit." else "Check your statement before confirming this credit.");ActionRow{Link("Confirm credit"){save {store.review(c,true)}};Link("Dismiss"){save {store.review(c,false)}}} }
+                        else if(data.free(c)>0){Text(money(data.free(c))+" available");Link(if(data.candidates(c).size>1)"Choose bill or refund" else "Allocate"){go("match",c.id)}}
+                        data.allocations.filter {it.credit==c.id}.forEach {a->
+                            Text(money(a.amount)+" → "+data.label(data.dues.first {it.id==a.due}));Text(a.reason,style=MaterialTheme.typography.bodySmall);Link("Undo match"){save {store.undo(a)}}
+                        }
                     }
                     "refundDetail"->data.dues.find {it.id==selected}?.let { d ->
                         Summary(d.name,money(data.left(d))+" outstanding","Promised "+money(d.amount))

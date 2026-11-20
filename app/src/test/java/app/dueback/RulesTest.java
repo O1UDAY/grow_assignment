@@ -68,6 +68,12 @@ public class RulesTest {
         assertEquals(Arrays.asList("1,200","a\"b"),Rules.csv("amount,payer\r\n\"1,200\",\"a\"\"b\"").get(1));
         reject(()->Rules.csv("\"unclosed"));
     }
+    @Test public void distinguishBalanceFromTransferAndFlagUncertainAmounts() {
+        assertEquals("450",Rules.parse("Available balance INR 5,000\nReceived INR 450 from mira@bank").amount);
+        assertEquals(Rules.Kind.REVIEW,Rules.parse("Credited INR 100 or INR 200").kind);
+        assertEquals(Rules.Kind.REVIEW,Rules.parse("Pending payment of INR 100 credited").kind);
+        assertEquals(Rules.Kind.IGNORE,Rules.parse("Lunch at 2 PM").kind);
+    }
     private static void reject(Runnable test) {
         try { test.run(); fail("Expected rejection"); } catch(IllegalArgumentException expected) { }
     }

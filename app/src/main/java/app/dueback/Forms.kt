@@ -11,23 +11,26 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import java.math.BigDecimal
 import java.time.LocalDate
 
 @Composable private fun Check(label:String,selected:Boolean,change:(Boolean)->Unit){
-    Row(verticalAlignment=Alignment.CenterVertically){Checkbox(selected,change);Text(label)}
+    Row(Modifier.fillMaxWidth().toggleable(value=selected,role=androidx.compose.ui.semantics.Role.Checkbox,onValueChange=change).heightIn(min=48.dp),verticalAlignment=Alignment.CenterVertically){Checkbox(selected,null);Spacer(Modifier.width(12.dp));Text(label)}
 }
-@Composable private fun Save(label:String,action:()->Unit){
+@Composable private fun Save(label:String,primary:Boolean=true,action:()->Unit){
     var error by rememberSaveable {mutableStateOf("")}
     if(error.isNotBlank()) Text(error,color=MaterialTheme.colorScheme.error)
-    Action(label){try{action()}catch(e:Exception){error=e.message?:"Check your entries."}}
+    val submit = { try { error="";action() } catch(e:Exception){error=e.message?:"Check your entries."} }
+    if(primary) Action(label,submit) else Link(label,submit)
 }
 private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amount greater than zero."}}
 @Composable fun RefundForm(raw:String,save:(Due)->Unit) {
@@ -38,10 +41,10 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
     var date by rememberSaveable {mutableStateOf(p.date)}
     var dest by rememberSaveable {mutableStateOf(p.destination)}
     var promised by rememberSaveable {mutableStateOf(p.kind!=Rules.Kind.CANCEL)}
-    if(raw.isNotBlank()) BoxCard{Text(raw)}
+    if(raw.isNotBlank()) SourcePreview(raw)
     if(p.kind==Rules.Kind.CANCEL) Check("Was a refund promised?",promised){promised=it}
-    Field("Merchant",merchant,{merchant=it});Field("Promised amount (₹)",amount,{amount=it})
-    Field("Order reference (optional)",ref,{ref=it});Field("Expected date (YYYY-MM-DD)",date,{date=it})
+    Field("Merchant",merchant,{merchant=it});Field("Promised amount (₹)",amount,{amount=it},keyboard=KeyboardType.Decimal)
+    Field("Order reference (optional)",ref,{ref=it});Field("Expected date (optional, YYYY-MM-DD)",date,{date=it})
     Field("Expected destination (optional)",dest,{dest=it})
     Save("Save refund"){require(promised){"Confirm that a refund was promised first."};require(merchant.isNotBlank()){"Enter a merchant."}
         require(date.isBlank() || runCatching { LocalDate.parse(date.trim()) }.isSuccess){"Use YYYY-MM-DD for the expected date."}
@@ -54,15 +57,15 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
     var payer by rememberSaveable {mutableStateOf(p.payer)}
     var dest by rememberSaveable {mutableStateOf(p.destination)}
     var order by rememberSaveable {mutableStateOf(p.order)}
-    var confirmed by rememberSaveable {mutableStateOf(raw.isEmpty() || p.kind==Rules.Kind.CREDIT)}
-    if(raw.isNotBlank()) BoxCard{Text(raw)}
-    Field("Amount received (₹)",amount,{amount=it});Field("UTR / transaction ID",ref,{ref=it})
+    var confirmed by rememberSaveable {mutableStateOf(raw.isEmpty())}
+    if(raw.isNotBlank()) SourcePreview(raw)
+    Field("Amount received (₹)",amount,{amount=it},keyboard=KeyboardType.Decimal);Field("UTR or transaction ID (optional)",ref,{ref=it})
     Field("Sender UPI ID or phone (optional)",payer,{payer=it});Field("Received in (bank, wallet or card)",dest,{dest=it})
     Field("Refund order reference (optional)",order,{order=it});Check("Money arrived in my account",confirmed){confirmed=it}
     Save("Save incoming payment"){
         require(payer.isBlank() || Rules.identity(payer).isNotEmpty()){"Enter a UPI ID or an Indian mobile number."}
         save(Credit(amount=positive(amount),reference=ref.trim().ifBlank {null},payer=payer,destination=dest.trim(),orderRef=order.trim(),
-            eventKey=null,source=if(raw.isEmpty())"Manual" else "Shared text",confirmed=confirmed))
+            eventKey=raw.takeIf { it.isNotBlank() }?.let(::textKey),source=if(raw.isEmpty())"Manual" else "Shared text",confirmed=confirmed))
     }
 }
 @Composable fun GroupForm(save:(String,List<Pair<String,String>>)->Unit){
@@ -94,7 +97,7 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
         require(id.isBlank() || Rules.identity(id).isNotBlank()){"Enter a valid UPI ID or Indian mobile number."}
         return name.trim() to Rules.identity(id)
     }
-    Save("Add member"){val m=checkedMember();names=ArrayList(names).apply{add(m.first)};ids=ArrayList(ids).apply{add(m.second)};name="";id=""}
+    Save("Add member",primary=false){val m=checkedMember();names=ArrayList(names).apply{add(m.first)};ids=ArrayList(ids).apply{add(m.second)};name="";id=""}
     Save("Create group"){require(title.isNotBlank()){"Give the group a name."}
         val members=names.zip(ids).toMutableList()
         if(name.isNotBlank() || id.isNotBlank())members.add(checkedMember())
@@ -107,10 +110,10 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
     var custom by rememberSaveable {mutableStateOf(false)}
     var values by rememberSaveable {mutableStateOf(ArrayList(List(people.size+1){""}))}
     val labels=listOf("You")+people.map {it.name}
-    Text(group.name);Field("Bill name",name,{name=it});Field("Total you paid (₹)",amount,{amount=it})
+    Text(group.name);Field("Bill name",name,{name=it});Field("Total you paid (₹)",amount,{amount=it},keyboard=KeyboardType.Decimal)
     Check("Use custom shares",custom){custom=it}
     val equal=runCatching{Rules.equal(positive(amount),labels.size).toList()}.getOrNull()
-    labels.forEachIndexed {i,label->if(custom)Field(label+" (₹)",values[i],{v->values=ArrayList(values).apply{set(i,v)}})
+    labels.forEachIndexed {i,label->if(custom)Field(label+" (₹)",values[i],{v->values=ArrayList(values).apply{set(i,v)}},keyboard=KeyboardType.Decimal)
         else Text(label+" · "+(equal?.get(i)?.let(::money)?:"—"))}
     Save("Save bill"){require(name.isNotBlank()){"Enter a bill name."}
         save(name.trim(),positive(amount),if(custom)values.map {Rules.paise(it)} else requireNotNull(equal))}
@@ -129,22 +132,13 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
         if(d in candidates)Text(if(d.bill.isEmpty())"Same order reference" else "Same payer ID")
     }}
     Check("Explicitly split this credit",split){split=it}
-    if(split) Field("Apply amount (₹)",amount,{amount=it})
+    if(split) Field("Apply amount (₹)",amount,{amount=it},keyboard=KeyboardType.Decimal)
     Save("Confirm allocation"){val d=all.find {it.id==chosen}?:error("Choose a refund or bill share.")
         save(d,if(split)positive(amount) else c.amount,split)}
 }
-@Composable fun AccessForm(say:(String)->Unit){
-    val ctx=LocalContext.current
-    Text("Android notification access lets DueBack read newly posted alerts. Choose the apps below. DueBack extracts payment and refund details on this device and discards unrelated text. Use CSV or shared messages for older transactions.")
-    sources.forEach {(pkg,title)->
-        var enabled by remember {mutableStateOf(prefs(ctx).getBoolean(pkg,false))}
-        Check(title,enabled){enabled=it;prefs(ctx).edit().putBoolean(pkg,it).apply()}
-    }
-    Action("Open notification access settings"){runCatching{ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))}.onFailure {say("Settings unavailable. Manual entry still works.")}}
-    val request=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){say(if(it)"Activity alerts enabled." else "You can still view the activity feed.")}
-    Link("Enable DueBack activity alerts"){
-        if(Build.VERSION.SDK_INT>=33)request.launch(Manifest.permission.POST_NOTIFICATIONS)
-        else runCatching{ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,ctx.packageName))}.onFailure {say("Use the activity feed to see updates.")}
-    }
-}
 
+@Composable private fun SourcePreview(raw:String) {
+    var show by remember { mutableStateOf(false) }
+    Link(if(show) "Hide source text" else "Show source text") { show=!show }
+    if(show) Text(raw)
+}

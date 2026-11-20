@@ -85,5 +85,54 @@ class LedgerTest {
         store.allocate(c.id,d2.id,20000,true)
         assertEquals(0L,store.state().free(c))
     }
-}
 
+    @Test fun selectedEmailNeedsReviewAndConfirmedCreditIsCountedOnce()=runBlocking {
+        val text="INR 125 credited. UTR: REF112233"
+        captureText(store,text,"Gmail","event1",false)
+        val credit=store.state().credits.single()
+        assertFalse(credit.confirmed)
+        importCsv(store,"amount,type,utr\n125,credit,ref112233")
+        assertEquals(1,store.state().credits.size)
+        assertTrue(store.state().allocations.isEmpty())
+    }
+
+    @Test fun missedParseAndEmptyNotificationsNeverCreateLedgerItems()=runBlocking {
+        assertEquals("No supported transaction found",captureText(store,"","Google Messages","empty",false))
+        assertEquals("No supported transaction found",captureText(store,"See you at lunch","Gmail","ordinary",false))
+        assertTrue(store.state().credits.isEmpty())
+        assertTrue(store.state().drafts.isEmpty())
+    }
+
+    @Test fun sameRefundCannotReturnAfterReview()=runBlocking {
+        val text="Shop: refund initiated for INR 800, order #ABC22"
+        captureText(store,text,"Gmail","mail1",false)
+        val draft=store.state().drafts.single()
+        store.refund(Due(name="Shop",amount=80000),draft.id)
+        assertEquals("Already recorded",captureText(store,text,"Google Messages","msg1",false))
+        assertTrue(store.state().drafts.isEmpty())
+        assertEquals(1,store.state().dues.size)
+    }
+
+    @Test fun reorderedCsvDoesNotReviveDismissedCredit()=runBlocking {
+        importCsv(store,"credit,payer_id\n25,alice@upi\n50,bob@upi")
+        val alice=store.state().credits.first { it.amount==2500L }
+        store.review(alice,false)
+        importCsv(store,"payer_id,credit\nbob@upi,50\nalice@upi,25")
+        assertEquals(listOf(5000L),store.state().credits.map {it.amount})
+    }
+
+    @Test fun missingReferenceRequiresReviewEvenWhenOrderMatches()=runBlocking {
+        store.refund(Due(name="Shop",amount=80000,orderRef="ABC22"))
+        captureText(store,"INR 800 credited for order ABC22","Google Pay","posted1",true)
+        assertFalse(store.state().credits.single().confirmed)
+        assertTrue(store.state().allocations.isEmpty())
+    }
+
+    @Test fun expandedNotificationAndTitleOnlyAreReadable() {
+        val n=android.app.Notification.Builder(app,"test").setContentTitle("Bank")
+            .setContentText("Open app").setStyle(android.app.Notification.BigTextStyle().bigText("INR 20 credited")).build()
+        assertEquals("Bank\nINR 20 credited",notificationText(n))
+        val titleOnly=android.app.Notification.Builder(app,"test").setContentTitle("Refund initiated").build()
+        assertEquals("Refund initiated",notificationText(titleOnly))
+    }
+}

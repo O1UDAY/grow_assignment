@@ -10,10 +10,11 @@ android {
         applicationId = "app.dueback"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
+        buildConfigField("boolean", "GMAIL_IMPORT_CONFIGURED", (providers.gradleProperty("dueback.gmailConfigured").orNull == "true").toString())
+        versionCode = 2
         versionName = "1.0"
     }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -23,6 +24,7 @@ android {
     testOptions.unitTests.isIncludeAndroidResources = true
 }
 dependencies {
+    implementation("com.google.android.gms:play-services-auth:21.3.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.03"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.9.3")

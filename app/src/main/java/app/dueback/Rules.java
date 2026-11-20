@@ -39,7 +39,12 @@ public final class Rules {
         String t=raw.replace('\u00a0',' ').trim();
         String l=t.toLowerCase(Locale.ROOT);
         Parsed p=new Parsed();
-        p.amount=field(t,"(?:₹|\\bINR\\s*|\\bRs\\.?\\s*)\\s*([0-9]+(?:,[0-9]+)*(?:\\.[0-9]{1,2})?)");
+        // A balance line is context, not the amount transferred.
+        String transactionLine = t.replaceAll("(?im)(?:avail(?:able)?|closing|current)\\s+(?:bal(?:ance)?)\\b[^\\n]*", "");
+        String amountPattern = "(?:₹|\\bINR|\\bRs\\.?)\\s*([0-9]+(?:,[0-9]+)*(?:\\.[0-9]{1,2})?)(?![.0-9]\\d)";
+        Matcher amounts = Pattern.compile(amountPattern, Pattern.CASE_INSENSITIVE).matcher(transactionLine);
+        p.amount = amounts.find() ? amounts.group(1) : "";
+        boolean ambiguousAmount = amounts.find();
         boolean refund=l.contains("refund");
         boolean future=l.matches("(?s).*(?:initiated|promised|processing|will be|to be credited|expected|being processed|on its way|has been issued).*");
         boolean incoming=l.matches("(?s).*\\b(?:credited|received|deposited)\\b.*");
@@ -51,6 +56,7 @@ public final class Rules {
             (l.contains("credited") || l.contains("deposited") || l.matches("(?s).*(?:received\\s+(?:(?:inr|rs\\.?|₹)\\s*\\d|a payment|money)|(?:inr|rs\\.?|₹)\\s*[\\d,.]+\\s+(?:was\\s+)?received).*"))) p.kind=Kind.CREDIT;
         else if((refund || l.matches("(?s).*\\b(?:payment|transaction|transfer|credit)\\b.*")) && !p.amount.isEmpty()) p.kind=Kind.REVIEW;
         else p.kind=Kind.IGNORE;
+        if (p.kind == Kind.CREDIT && (ambiguousAmount || l.matches("(?s).*\\b(?:pending|scheduled|not yet|reversed)\\b.*"))) p.kind = Kind.REVIEW;
         p.reference=field(t,"\\b(?:utr|rrn|upi\\s*ref(?:erence)?|txn\\s*(?:id|ref)|transaction\\s*(?:id|ref))\\s*(?:no\\.?\\s*)?[:#= -]*([a-z0-9][a-z0-9-]{4,})\\b");
         p.order=field(t,"\\border\\s*(?:id|ref(?:erence)?|no\\.?)?\\s*[:#= -]*([a-z0-9-]*\\d[a-z0-9-]*)\\b");
         p.merchant=field(t,"(?:merchant\\s*[:=]|(?:refund|order)\\s+from)\\s*([\\p{L}][\\p{L}0-9 &.-]{0,45}?)(?=\\s+(?:order|for|of|has|was|is|will)|[,;\\n]|$)");

@@ -10,7 +10,8 @@ fun uid() = UUID.randomUUID().toString()
 @Entity data class Person(@PrimaryKey val id: String = uid(), val circle: String, val name: String, val identity: String)
 @Entity data class Bill(@PrimaryKey val id: String = uid(), val circle: String, val name: String, val total: Long, val mine: Long)
 @Entity data class Due(@PrimaryKey val id: String = uid(), val name: String, val amount: Long,
-    val bill: String = "", val person: String = "", val orderRef: String = "", val date: String = "", val destination: String = "")
+    val bill: String = "", val person: String = "", val orderRef: String = "", val date: String = "", val destination: String = "",
+    @ColumnInfo(defaultValue = "'Previously recorded'") val origin:String="Manual")
 @Entity(indices=[Index(value=["reference"], unique=true), Index(value=["eventKey"], unique=true)])
 data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val reference: String?, val eventKey: String?,
     val payer: String, val destination: String, val source: String, val confirmed: Boolean, val orderRef: String = "")
@@ -18,6 +19,7 @@ data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val refe
 @Entity data class ActivityLine(@PrimaryKey(autoGenerate=true) val id: Long = 0, val text: String)
 @Entity data class Draft(@PrimaryKey val id: String, val message: String)
 
+@Entity data class SeenInput(@PrimaryKey val token: String)
 @Dao interface Books {
     @Query("SELECT * FROM Circle ORDER BY rowid DESC") suspend fun circles(): List<Circle>
     @Query("SELECT * FROM Person ORDER BY rowid") suspend fun people(): List<Person>
@@ -28,6 +30,7 @@ data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val refe
     @Query("SELECT * FROM ActivityLine ORDER BY id DESC LIMIT 100") suspend fun feed(): List<ActivityLine>
     @Query("SELECT * FROM Draft") suspend fun drafts(): List<Draft>
     @Query("SELECT MAX(id) FROM ActivityLine") fun changes(): Flow<Long?>
+    @Insert(onConflict=OnConflictStrategy.IGNORE) suspend fun remember(input: SeenInput): Long
     @Insert suspend fun add(x: Circle)
     @Insert suspend fun add(x: Person)
     @Insert suspend fun add(x: Bill)
@@ -41,13 +44,20 @@ data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val refe
     @Query("UPDATE Credit SET confirmed=1 WHERE id=:id") suspend fun confirm(id: String)
     @Query("DELETE FROM Credit WHERE id=:id AND confirmed=0") suspend fun dismiss(id: String)
 }
-@Database(entities=[Circle::class, Person::class, Bill::class, Due::class, Credit::class, Allocation::class, ActivityLine::class, Draft::class], version=1, exportSchema=false)
+@Database(entities=[Circle::class, Person::class, Bill::class, Due::class, Credit::class, Allocation::class, ActivityLine::class, Draft::class, SeenInput::class], version=2, exportSchema=false)
 abstract class Ledger : RoomDatabase() {
     abstract fun books(): Books
     companion object {
         @Volatile private var instance: Ledger? = null
         fun get(c: Context): Ledger = instance ?: synchronized(this) {
-            instance ?: Room.databaseBuilder(c.applicationContext, Ledger::class.java,"dueback.db").build().also { instance=it }
+            instance ?: Room.databaseBuilder(c.applicationContext, Ledger::class.java,"dueback.db")
+                .addMigrations(object : androidx.room.migration.Migration(1, 2) {
+                    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                        db.execSQL("ALTER TABLE Due ADD COLUMN origin TEXT NOT NULL DEFAULT 'Previously recorded'")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS SeenInput (token TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("INSERT OR IGNORE INTO SeenInput SELECT id FROM Draft")
+                    }
+                }).build().also { instance=it }
         }
     }
 }
@@ -69,6 +79,9 @@ class Store(val db: Ledger) {
     suspend fun note(s: String) = q.add(ActivityLine(text=s))
     suspend fun refund(d: Due, draftId: String="") = db.withTransaction {
         require(d.amount>0 && d.name.isNotBlank())
+        if(draftId.isNotBlank() && q.drafts().none { it.id == draftId }) {
+            require(q.remember(SeenInput(draftId)) != -1L) { "This refund was already reviewed." }
+        }
         q.add(d)
         q.dropDraft(draftId)
         note("Refund promised by "+d.name)
@@ -91,10 +104,12 @@ class Store(val db: Ledger) {
     suspend fun ingest(input: Credit, auto: Boolean=true): String = db.withTransaction {
         require(input.amount>0)
         val c=input.copy(reference=input.reference?.trim()?.uppercase()?.ifBlank { null }, payer=Rules.identity(input.payer))
+        if (c.eventKey != null && q.remember(SeenInput(c.eventKey)) == -1L) return@withTransaction "Already recorded"
         val s=state()
         if(s.credits.any { Accounting.duplicate(c.reference,c.eventKey,it.reference,it.eventKey) }) return@withTransaction "Already recorded"
         // Unreferenced imports require confirmation before they affect a balance.
-        val saved=if(c.reference==null && c.source!="Manual") c.copy(confirmed=false) else c
+        val possibleDuplicate = s.credits.any { it.amount == c.amount && (it.reference == null || c.reference == null) }
+        val saved=if((c.reference==null && c.source!="Manual") || possibleDuplicate) c.copy(confirmed=false) else c
         q.add(saved)
         val targets=s.candidates(saved)
         val msg=when {
@@ -124,14 +139,4 @@ class Store(val db: Ledger) {
         if(accept) q.confirm(c.id) else q.dismiss(c.id)
         note(if(accept) "Incoming credit confirmed" else "Review item dismissed")
     }
-    suspend fun demo() = db.withTransaction {
-        require(q.circles().isEmpty() && q.dues().isEmpty() && q.credits().isEmpty() && q.drafts().isEmpty()) { "Demo is available in an empty ledger." }
-        val d=Due(name="Juniper Shop",amount=120000,orderRef="DEMO-17",destination="Bank and wallet")
-        refund(d)
-        for((amount,dest) in listOf(90000L to "Bank",20000L to "Wallet")) ingest(Credit(amount=amount,reference="DEMO"+amount,eventKey=null,payer="",destination=dest,source="Demo",confirmed=true,orderRef=d.orderRef))
-        group("Weekend lunch",listOf("Mira" to "mira@example","Dev" to "dev@example"))
-        bill(q.circles().first(),"Lunch",90000,listOf(30000,30000,30000))
-        ingest(Credit(amount=20000,reference="DEMO-MIRA",eventKey=null,payer="mira@example",destination="Bank",source="Demo",confirmed=true))
-    }
 }
-

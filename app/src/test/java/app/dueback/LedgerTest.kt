@@ -88,7 +88,7 @@ class LedgerTest {
 
     @Test fun selectedEmailNeedsReviewAndConfirmedCreditIsCountedOnce()=runBlocking {
         val text="INR 125 credited. UTR: REF112233"
-        captureText(store,text,"Gmail","event1",false)
+        captureText(store,text,"Gmail","event1")
         val credit=store.state().credits.single()
         assertFalse(credit.confirmed)
         importCsv(store,"amount,type,utr\n125,credit,ref112233")
@@ -97,18 +97,18 @@ class LedgerTest {
     }
 
     @Test fun missedParseAndEmptyNotificationsNeverCreateLedgerItems()=runBlocking {
-        assertEquals("No supported transaction found",captureText(store,"","Google Messages","empty",false))
-        assertEquals("No supported transaction found",captureText(store,"See you at lunch","Gmail","ordinary",false))
+        assertEquals("No supported transaction found",captureText(store,"","Google Messages","empty"))
+        assertEquals("No supported transaction found",captureText(store,"See you at lunch","Gmail","ordinary"))
         assertTrue(store.state().credits.isEmpty())
         assertTrue(store.state().drafts.isEmpty())
     }
 
     @Test fun sameRefundCannotReturnAfterReview()=runBlocking {
-        val text="Shop: refund initiated for INR 800, order #ABC22"
-        captureText(store,text,"Gmail","mail1",false)
+        val text="Shop: refund initiated for INR 800, order #ABC22. UTR ABC12345"
+        captureText(store,text,"Gmail","mail1")
         val draft=store.state().drafts.single()
         store.refund(Due(name="Shop",amount=80000),draft.id)
-        assertEquals("Already recorded",captureText(store,text,"Google Messages","msg1",false))
+        assertEquals("Already recorded",captureText(store,text,"Google Messages","msg1"))
         assertTrue(store.state().drafts.isEmpty())
         assertEquals(1,store.state().dues.size)
     }
@@ -123,7 +123,7 @@ class LedgerTest {
 
     @Test fun missingReferenceRequiresReviewEvenWhenOrderMatches()=runBlocking {
         store.refund(Due(name="Shop",amount=80000,orderRef="ABC22"))
-        captureText(store,"INR 800 credited for order ABC22","Google Pay","posted1",true)
+        captureText(store,"INR 800 credited for order ABC22","Google Pay","posted1")
         assertFalse(store.state().credits.single().confirmed)
         assertTrue(store.state().allocations.isEmpty())
     }
@@ -134,5 +134,68 @@ class LedgerTest {
         assertEquals("Bank\nINR 20 credited",notificationText(n))
         val titleOnly=android.app.Notification.Builder(app,"test").setContentTitle("Refund initiated").build()
         assertEquals("Refund initiated",notificationText(titleOnly))
+    }
+
+    @Test fun replayAndOverlappingImportsKeepDistinctUnidentifiedEventsInReview()=runBlocking {
+        val msg="INR 300 credited"
+        captureText(store,msg,"Payment app","post1",1000L)
+        captureText(store,msg,"Payment app","post1",1000L)
+        captureText(store,msg,"Payment app","post2",2000L)
+        importCsv(store,"credit,utr\\n300,UTR12345")
+        importCsv(store,"credit,utr\\n300,UTR12345\\n300,UTR67890")
+        assertEquals(4,store.state().credits.size)
+        assertEquals(4,store.state().credits.count { !it.confirmed })
+        assertTrue(store.state().allocations.isEmpty())
+    }
+
+    @Test fun bankNotificationWithReferenceNeverSettlesOnItsOwn()=runBlocking {
+        store.refund(Due(name="Shop",amount=80000,orderRef="ABC22"))
+        captureText(store,"INR 800 credited for order ABC22. UTR TEST12345","Bank","post-with-ref",1000L)
+        assertFalse(store.state().credits.single().confirmed)
+        assertEquals(80000L,store.state().left(store.state().dues.single()))
+    }
+
+    @Test fun upgradeV2RetainsExistingBalanceAndReviewItems()=runBlocking {
+        val name="migration-test"
+        app.deleteDatabase(name)
+        app.openOrCreateDatabase(name,0,null).use { db ->
+            val fixture=requireNotNull(javaClass.classLoader?.getResourceAsStream("ledger-v2.sql"))
+            fixture.bufferedReader().useLines { lines -> lines.filter {it.isNotBlank()}.forEach {db.execSQL(it)} }
+        }
+        val upgraded=Room.databaseBuilder(app,Ledger::class.java,name).addMigrations(migration23).build()
+        try {
+            val state=Store(upgraded).state()
+            assertEquals(6000L,state.left(state.dues.single()))
+            assertEquals("House",state.circles.single().name)
+            assertEquals("t",state.drafts.single().id)
+            assertNull(state.credits.single().sourceTime)
+            assertEquals("Selected by you",state.allocations.single().reason)
+        } finally {upgraded.close();app.deleteDatabase(name)}
+    }
+
+    @Test fun multipartAlternativeUsesPlainBodyAndSkipsAttachment()=runBlocking {
+        val part=org.json.JSONObject("""{"mimeType":"multipart/alternative","parts":[
+            {"mimeType":"text/html","body":{"data":"PGI-SFRNTDwvYj4"}},
+            {"mimeType":"text/plain","filename":"ignored.txt","body":{"data":"ZmFrZQ"}},
+            {"mimeType":"text/plain","body":{"data":"SU5SIDEwMCBjcmVkaXRlZA"}}
+        ]}""")
+        assertEquals("INR 100 credited",emailBody(part){error("Unexpected attachment request")})
+    }
+
+    @Test fun groupedUpdateReplaysOldMessageWithoutLosingNewOne()=runBlocking {
+        val notification=android.app.Notification.Builder(app,"test").build()
+        fun entry(text:String,t:Long)=android.os.Bundle().apply {
+            putString("text",text);putLong("time",t);putString("sender","Bank")
+        }
+        val first=entry("INR 100 credited",1000L)
+        val second=entry("INR 100 credited",2000L)
+        suspend fun receive(vararg entries:android.os.Bundle) {
+            notification.extras.putParcelableArray(android.app.Notification.EXTRA_MESSAGES,entries)
+            for((body,time,key) in notificationEvents(notification,"com.example.bank","chat",900L))
+                captureText(store,body,"Bank",key,time)
+        }
+        receive(first);receive(first,second)
+        assertEquals(listOf(1000L,2000L),store.state().credits.mapNotNull {it.sourceTime}.sorted())
+        assertTrue(store.state().credits.none {it.confirmed})
     }
 }

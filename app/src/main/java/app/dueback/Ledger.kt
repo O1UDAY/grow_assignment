@@ -11,13 +11,13 @@ fun uid() = UUID.randomUUID().toString()
 @Entity data class Bill(@PrimaryKey val id: String = uid(), val circle: String, val name: String, val total: Long, val mine: Long)
 @Entity data class Due(@PrimaryKey val id: String = uid(), val name: String, val amount: Long,
     val bill: String = "", val person: String = "", val orderRef: String = "", val date: String = "", val destination: String = "",
-    @ColumnInfo(defaultValue = "'Previously recorded'") val origin:String="Manual")
+    @ColumnInfo(defaultValue = "'Previously recorded'") val origin:String="Manual", val sourceTime:Long?=null, val sourceZone:String?=null)
 @Entity(indices=[Index(value=["reference"], unique=true), Index(value=["eventKey"], unique=true)])
 data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val reference: String?, val eventKey: String?,
-    val payer: String, val destination: String, val source: String, val confirmed: Boolean, val orderRef: String = "")
+    val payer: String, val destination: String, val source: String, val confirmed: Boolean, val orderRef: String = "", val sourceTime:Long?=null, val sourceZone:String?=null)
 @Entity data class Allocation(@PrimaryKey val id: String = uid(), val credit: String, val due: String, val amount: Long, val reason: String)
 @Entity data class ActivityLine(@PrimaryKey(autoGenerate=true) val id: Long = 0, val text: String)
-@Entity data class Draft(@PrimaryKey val id: String, val message: String)
+@Entity data class Draft(@PrimaryKey val id: String, val message: String, val sourceTime:Long?=null, val sourceZone:String?=null, @ColumnInfo(defaultValue="0") val payment:Boolean=false)
 
 @Entity data class SeenInput(@PrimaryKey val token: String)
 @Dao interface Books {
@@ -44,7 +44,19 @@ data class Credit(@PrimaryKey val id: String = uid(), val amount: Long, val refe
     @Query("UPDATE Credit SET confirmed=1 WHERE id=:id") suspend fun confirm(id: String)
     @Query("DELETE FROM Credit WHERE id=:id AND confirmed=0") suspend fun dismiss(id: String)
 }
-@Database(entities=[Circle::class, Person::class, Bill::class, Due::class, Credit::class, Allocation::class, ActivityLine::class, Draft::class, SeenInput::class], version=2, exportSchema=false)
+internal val migration23 = object : androidx.room.migration.Migration(2, 3) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE Due ADD COLUMN sourceTime INTEGER")
+        db.execSQL("ALTER TABLE Due ADD COLUMN sourceZone TEXT")
+        db.execSQL("ALTER TABLE Credit ADD COLUMN sourceTime INTEGER")
+        db.execSQL("ALTER TABLE Credit ADD COLUMN sourceZone TEXT")
+        db.execSQL("ALTER TABLE Draft ADD COLUMN sourceTime INTEGER")
+        db.execSQL("ALTER TABLE Draft ADD COLUMN sourceZone TEXT")
+        db.execSQL("ALTER TABLE Draft ADD COLUMN payment INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+@Database(entities=[Circle::class, Person::class, Bill::class, Due::class, Credit::class, Allocation::class, ActivityLine::class, Draft::class, SeenInput::class], version=3, exportSchema=false)
 abstract class Ledger : RoomDatabase() {
     abstract fun books(): Books
     companion object {
@@ -57,7 +69,7 @@ abstract class Ledger : RoomDatabase() {
                         db.execSQL("CREATE TABLE IF NOT EXISTS SeenInput (token TEXT NOT NULL PRIMARY KEY)")
                         db.execSQL("INSERT OR IGNORE INTO SeenInput SELECT id FROM Draft")
                     }
-                }).build().also { instance=it }
+                }, migration23).build().also { instance=it }
         }
     }
 }
@@ -82,9 +94,22 @@ class Store(val db: Ledger) {
         if(draftId.isNotBlank() && q.drafts().none { it.id == draftId }) {
             require(q.remember(SeenInput(draftId)) != -1L) { "This refund was already reviewed." }
         }
-        q.add(d)
+        val draft=q.drafts().firstOrNull { it.id==draftId }
+        q.add(d.copy(sourceTime=draft?.sourceTime ?: d.sourceTime, sourceZone=draft?.sourceZone ?: d.sourceZone))
         q.dropDraft(draftId)
         note("Refund promised by "+d.name)
+    }
+    suspend fun deleteImports() = db.withTransaction {
+        val sql=db.openHelper.writableDatabase
+        val importedCredits="SELECT id FROM Credit WHERE source != 'Manual'"
+        val importedRefunds="SELECT id FROM Due WHERE bill='' AND origin NOT IN ('Manual','Previously recorded')"
+        sql.execSQL("DELETE FROM Allocation WHERE credit IN ($importedCredits) OR due IN ($importedRefunds)")
+        sql.execSQL("DELETE FROM Credit WHERE id IN ($importedCredits)")
+        sql.execSQL("DELETE FROM Due WHERE id IN ($importedRefunds)")
+        sql.execSQL("DELETE FROM Draft")
+        sql.execSQL("DELETE FROM SeenInput")
+        sql.execSQL("DELETE FROM ActivityLine")
+        note("Imported data deleted")
     }
     suspend fun group(name: String, members: List<Pair<String,String>>) = db.withTransaction {
         require(name.isNotBlank() && members.isNotEmpty() && members.all { it.first.isNotBlank() })

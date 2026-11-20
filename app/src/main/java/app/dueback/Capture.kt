@@ -17,9 +17,20 @@ import java.util.Locale
 fun money(p: Long): String = NumberFormat.getCurrencyInstance(Locale("en","IN")).apply {
     minimumFractionDigits=if(p%100==0L) 0 else 2
 }.format(BigDecimal.valueOf(p,2))
-val sources=mapOf("com.google.android.apps.nbu.paisa.user" to "Google Pay","com.phonepe.app" to "PhonePe",
-    "com.google.android.apps.messaging" to "Google Messages","com.google.android.gm" to "Gmail",
-    "com.sbi.lotusintouch" to "YONO SBI","com.csam.icici.bank.imobile" to "iMobile")
+internal fun installedSources(c:Context):Map<String,String> {
+    val pm=c.packageManager
+    val pairs=listOf("smsto","mailto","upi").flatMap { scheme ->
+        val action=if(scheme=="upi") Intent.ACTION_VIEW else Intent.ACTION_SENDTO
+        val uri=android.net.Uri.parse(if(scheme=="upi") "upi://pay" else "$scheme:")
+        pm.queryIntentActivities(Intent(action,uri),0).map { it.activityInfo.applicationInfo }
+    }.toMutableList()
+    for(pkg in listOf("com.sbi.lotusintouch","com.csam.icici.bank.imobile","com.snapwork.hdfc","com.axis.mobile",
+        "com.phonepe.app","com.google.android.apps.nbu.paisa.user","com.google.android.apps.messaging","com.google.android.gm")) {
+        try { pairs.add(pm.getApplicationInfo(pkg,0)) } catch(_:PackageManager.NameNotFoundException) { }
+    }
+    return pairs.filter {it.enabled && it.packageName!=c.packageName}.distinctBy {it.packageName}
+        .sortedBy {it.loadLabel(pm).toString()}.associate {it.packageName to it.loadLabel(pm).toString()}
+}
 fun prefs(c: Context)=c.getSharedPreferences("capture",Context.MODE_PRIVATE)
 fun digest(s:String)=MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
 fun deliver(c:Context,msg:String) {
@@ -33,29 +44,30 @@ fun deliver(c:Context,msg:String) {
 }
 private const val NO_TRANSACTION = "No supported transaction found"
 private const val DUPLICATE = "Already recorded"
-internal fun sourceAllowed(pkg: String, selected: Boolean, summary: Boolean) =
-    CapturePolicy.accept(pkg in sources, selected, summary)
+
 
 internal fun textKey(raw: String) = "text/" + digest(raw.trim().lowercase(Locale.ROOT).replace(Regex("\\s+"), " "))
 
-internal fun refundKey(p: Rules.Parsed, raw: String): String {
-    if (p.merchant.isBlank() || p.order.isBlank() || p.amount.isBlank()) return textKey(raw)
-    return "refund/" + digest(listOf(p.merchant.trim().lowercase(Locale.ROOT), p.order.uppercase(Locale.ROOT),
-        runCatching { Rules.paise(p.amount).toString() }.getOrDefault(p.amount)).joinToString("|"))
-}
-
-internal suspend fun captureText(store: Store, raw: String, source: String, key: String, trustedCredit: Boolean): String {
-    val p = Rules.parse(raw)
+internal suspend fun captureText(store: Store, raw: String, source: String, key: String, sourceTime: Long? = null, zone:java.time.ZoneId=java.time.ZoneId.systemDefault()): String {
+    val p = Rules.parse(raw, sourceTime?.let(java.time.Instant::ofEpochMilli), zone)
+    if(p.kind==Rules.Kind.REVIEW && (p.amount.isBlank() || p.amountNeedsReview)) {
+        return store.db.withTransaction {
+            if(store.q.remember(SeenInput(key)) == -1L) return@withTransaction DUPLICATE
+            val extracted=listOf("Check payment amount","Transaction ID "+p.reference,"order "+p.order,"Source: "+source).joinToString("\n")
+            store.q.draft(Draft(key,extracted,sourceTime,zone.id,true))
+            "Payment amount needs review".also {store.note(it)}
+        }
+    }
     return when (p.kind) {
         Rules.Kind.IGNORE -> NO_TRANSACTION
         Rules.Kind.PROMISE, Rules.Kind.CANCEL -> store.db.withTransaction {
-            val id = refundKey(p, raw)
+            val id = if (p.reference.isNotBlank()) "refund-reference/"+digest(p.reference.uppercase(Locale.ROOT)) else key
             if (store.q.remember(SeenInput(id)) == -1L) return@withTransaction DUPLICATE
             val fields = listOf("Merchant: " + p.merchant,
                 if (p.kind == Rules.Kind.CANCEL) "Cancelled" else "Refund initiated",
-                "INR " + p.amount, "order " + p.order, "expected " + p.date, "destination: " + p.destination,
-                "Source: " + source).joinToString("\n")
-            store.q.draft(Draft(id, fields))
+                if(p.amountNeedsReview) "Check the promised amount" else "INR " + p.amount, "order " + p.order, "expected " + p.date, "destination: " + p.destination,
+                if(p.dateNeedsReview) "Check expected date: source date or business calendar uncertain." else "", "Source: " + source).filter {it.isNotBlank()}.joinToString("\n")
+            store.q.draft(Draft(id, fields,sourceTime,zone.id))
             "Refund ready for review".also { store.note(it) }
         }
         else -> {
@@ -63,7 +75,7 @@ internal suspend fun captureText(store: Store, raw: String, source: String, key:
             if (amount <= 0) return NO_TRANSACTION
             store.ingest(Credit(amount=amount, reference=p.reference.ifBlank { null }, eventKey=key,
                 payer=p.payer, destination=p.destination, source=source,
-                confirmed=trustedCredit && p.kind == Rules.Kind.CREDIT, orderRef=p.order))
+                sourceTime=sourceTime,sourceZone=zone.id,confirmed=false, orderRef=p.order))
         }
     }
 }
@@ -77,6 +89,26 @@ internal fun notificationText(n: Notification): String {
         .firstOrNull { !it.isNullOrBlank() }
     return listOfNotNull(extras.getCharSequence(Notification.EXTRA_TITLE), body)
         .joinToString("\n").take(12000)
+}
+
+internal fun notificationEvents(notification:Notification,pkg:String,notificationKey:String,instanceTime:Long):List<Triple<String,Long,String>> {
+    val messages=notification.extras?.getParcelableArray(Notification.EXTRA_MESSAGES)
+        .orEmpty().filterIsInstance<android.os.Bundle>()
+    val isSummary=notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
+    return when {
+        messages.isNotEmpty() -> messages.mapNotNull { bundle ->
+            val body=bundle.getCharSequence("text")?.toString()?.take(12000) ?: return@mapNotNull null
+            val stamp=bundle.getLong("time").takeIf {it>0} ?: instanceTime
+            val sender=bundle.getCharSequence("sender")?.toString().orEmpty()
+            Triple(body,stamp,digest("$pkg|$sender|$stamp|"+textKey(body)))
+        }
+        isSummary -> emptyList()
+        else -> {
+            val body=notificationText(notification)
+            val stamp=notification.`when`.takeIf {it>0} ?: instanceTime
+            listOf(Triple(body,stamp,digest(notificationKey+"|"+instanceTime+"|"+textKey(body))))
+        }
+    }
 }
 
 class CaptureService: NotificationListenerService() {
@@ -96,29 +128,56 @@ class CaptureService: NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val pkg = sbn.packageName
         val settings = prefs(this)
-        if (!sourceAllowed(pkg, settings.getBoolean(pkg, false), sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0)) return
-        val time = System.currentTimeMillis()
-        val instanceTime = activePosts.getOrPut(sbn.key) { sbn.postTime }
+        if(pkg==packageName && sbn.tag=="capture-test") {
+            val nonce=settings.getString("probe",null) ?: return
+            if(sbn.notification.extras.getString("dueback_probe")==nonce) {
+                val parsed=Rules.parse(notificationText(sbn.notification))
+                val ok=parsed.kind==Rules.Kind.CREDIT && parsed.amount=="12.34"
+                settings.edit().remove("probe").putString("testResult",if(ok) "Passed: Android delivered the test and the parser recognised INR 12.34." else "Delivered, but parsing failed.").apply()
+                cancelNotification(sbn.key)
+            }
+            return
+        }
+        if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) return
+        val source=installedSources(this)[pkg] ?: return
+        val time=System.currentTimeMillis()
+        val instanceTime=activePosts.getOrPut(sbn.key) { sbn.postTime }
         scope.launch {
-            if (!settings.getBoolean(pkg, false)) return@launch
-            val source = sources.getValue(pkg)
-            val outcome = try {
-                val raw = notificationText(sbn.notification)
-                val trusted = pkg in setOf("com.google.android.apps.nbu.paisa.user", "com.phonepe.app",
-                    "com.sbi.lotusintouch", "com.csam.icici.bank.imobile")
-                val result = captureText(Store(Ledger.get(this@CaptureService)), raw, source,
-                    digest(sbn.key + "|" + instanceTime + "|" + textKey(raw)), trusted)
-                if (result != DUPLICATE && result != NO_TRANSACTION) deliver(this@CaptureService, "Open DueBack to review ledger activity.")
-                when {
-                    result == DUPLICATE || result == NO_TRANSACTION -> result
-                    result.startsWith("Matched ") -> "Credit matched"
-                    else -> "Transaction saved for review"
+            if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) return@launch
+            var failed=false
+            val outcome=try {
+                val notification=sbn.notification
+                val isSummary=notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
+                val inputs=notificationEvents(notification,pkg,sbn.key,instanceTime)
+                val store=Store(Ledger.get(this@CaptureService))
+                var saved=0
+                var duplicates=0
+                for((body,stamp,key) in inputs) {
+                    if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) break
+                    val result=store.db.withTransaction {
+                        if(settings.getBoolean("paused",false) || !settings.getBoolean(pkg,false)) NO_TRANSACTION
+                        else captureText(store,body,source,key,stamp)
+                    }
+                    when(result){
+                        DUPLICATE -> duplicates++
+                        NO_TRANSACTION -> Unit
+                        else -> saved++
+                    }
                 }
-            } catch(e: CancellationException) { throw e }
-              catch(e: Exception) { "Could not process event. Share the text or import a CSV." }
-            if (settings.getLong("eventTime", 0L) > time) return@launch
-            settings.edit().putLong("eventTime", time).putString("eventSource", source)
-                .putString("outcome", outcome).apply()
+                when {
+                    saved>0 -> { deliver(this@CaptureService,"New items are ready to review."); "$saved ready for review" }
+                    duplicates>0 -> DUPLICATE
+                    isSummary && inputs.isEmpty() -> "Group summary. Waiting for individual messages."
+                    notification.extras?.getCharSequence(Notification.EXTRA_TEXT).isNullOrBlank() &&
+                        notification.extras?.getCharSequence(Notification.EXTRA_BIG_TEXT).isNullOrBlank() ->
+                        "No supported transaction. Preview missing or limited to a title."
+                    else -> NO_TRANSACTION
+                }
+            } catch(e:CancellationException){throw e}
+              catch(e:Exception){failed=true; "Processing failed. Share the message or import the statement."}
+            if (settings.getLong("eventTime",0)>time) return@launch
+            settings.edit().putLong("eventTime",time).putString("eventSource",source)
+                .putBoolean("processingFailed",failed).putString("outcome",outcome).apply()
         }
     }
 }
@@ -147,7 +206,10 @@ suspend fun importCsv(store:Store,text:String):String = store.db.withTransaction
         val amount=col("credit","amount")
         val p=try {Rules.paise(amount)} catch(e:Exception) {throw IllegalArgumentException("Row ${index+2}: check the amount.")}
         if(p==0L) { skipped++;return@forEachIndexed }
-        val confirmed=kind in listOf("credit","cr","received") || ("credit" in header && kind.isBlank())
+        val stamp=col("timestamp","date_time")
+        val sourceDate=if(stamp.isBlank()) null else try {
+            java.time.OffsetDateTime.parse(stamp)
+        } catch(e:java.time.DateTimeException){throw IllegalArgumentException("Row ${index+2}: use an ISO timestamp with timezone, or leave it empty.")}
         val signature = rowKeys[index]
         val occurrence = seenRows.getOrDefault(signature, 0)
         seenRows[signature] = occurrence + 1
@@ -155,7 +217,7 @@ suspend fun importCsv(store:Store,text:String):String = store.db.withTransaction
         if (legacyKey in existingKeys) { duplicates++; return@forEachIndexed }
         val msg=store.ingest(Credit(amount=p,reference=col("utr","rrn","transaction_id","reference").ifBlank { null },
             eventKey="csv/$statement/$signature/$occurrence",payer=col("payer_id","upi_id"),destination=col("destination","account"),
-            source="CSV",confirmed=confirmed,orderRef=col("order_ref")))
+            sourceTime=sourceDate?.toInstant()?.toEpochMilli(),sourceZone=sourceDate?.offset?.id,source="CSV",confirmed=false,orderRef=col("order_ref")))
         if(msg=="Already recorded") duplicates++ else added++
     }
     val summary="Imported "+added+" · "+duplicates+" duplicates · "+skipped+" skipped"

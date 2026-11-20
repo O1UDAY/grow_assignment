@@ -42,6 +42,7 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
     var dest by rememberSaveable {mutableStateOf(p.destination)}
     var promised by rememberSaveable {mutableStateOf(p.kind!=Rules.Kind.CANCEL)}
     if(raw.isNotBlank()) SourcePreview(raw)
+    if(p.dateNeedsReview || raw.contains("business calendar uncertain")) Text("Check the expected date with the merchant. Business calendars can vary.")
     if(p.kind==Rules.Kind.CANCEL) Check("Was a refund promised?",promised){promised=it}
     Field("Merchant",merchant,{merchant=it});Field("Promised amount (₹)",amount,{amount=it},keyboard=KeyboardType.Decimal)
     Field("Order reference (optional)",ref,{ref=it});Field("Expected date (optional, YYYY-MM-DD)",date,{date=it})
@@ -65,7 +66,7 @@ private fun positive(s:String)=Rules.paise(s).also {require(it>0){"Enter an amou
     Save("Save incoming payment"){
         require(payer.isBlank() || Rules.identity(payer).isNotEmpty()){"Enter a UPI ID or an Indian mobile number."}
         save(Credit(amount=positive(amount),reference=ref.trim().ifBlank {null},payer=payer,destination=dest.trim(),orderRef=order.trim(),
-            eventKey=raw.takeIf { it.isNotBlank() }?.let(::textKey),source=if(raw.isEmpty())"Manual" else "Shared text",confirmed=confirmed))
+            eventKey=null,source=if(raw.isEmpty())"Manual" else "Shared text",confirmed=confirmed))
     }
 }
 @Composable fun GroupForm(save:(String,List<Pair<String,String>>)->Unit){

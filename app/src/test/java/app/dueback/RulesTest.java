@@ -74,6 +74,15 @@ public class RulesTest {
         assertEquals(Rules.Kind.REVIEW,Rules.parse("Pending payment of INR 100 credited").kind);
         assertEquals(Rules.Kind.IGNORE,Rules.parse("Lunch at 2 PM").kind);
     }
+    @Test public void relativeDatesUseOriginalLocalDay() {
+        java.time.Instant original=java.time.Instant.parse("2021-06-10T23:50:00Z");
+        String text="Refund initiated for INR 500 within 7 days";
+        assertEquals("2021-06-18",Rules.parse(text,original,java.time.ZoneId.of("Asia/Kolkata")).date);
+        assertEquals("2021-06-17",Rules.parse(text,original,java.time.ZoneOffset.UTC).date);
+        assertTrue(Rules.parse(text).dateNeedsReview);
+        Rules.Parsed business=Rules.parse("Refund expected within 7 working days",original,java.time.ZoneOffset.UTC);
+        assertTrue(business.dateNeedsReview);assertEquals("",business.date);
+    }
     private static void reject(Runnable test) {
         try { test.run(); fail("Expected rejection"); } catch(IllegalArgumentException expected) { }
     }

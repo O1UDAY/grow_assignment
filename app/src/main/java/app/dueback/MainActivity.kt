@@ -70,12 +70,19 @@ class MainActivity:ComponentActivity() {
 }
 @Composable fun Action(label:String,onClick:()->Unit) { Button(onClick=onClick,shape=RoundedCornerShape(6.dp)){ Text(label) } }
 @Composable fun Link(label:String,onClick:()->Unit) { TextButton(onClick=onClick,shape=RoundedCornerShape(6.dp)){ Text(label) } }
-@Composable fun Section(title:String){Text(title,style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.Bold,color=ink)}
+@Composable fun Section(title:String){Text(title,modifier=Modifier.semantics { heading() },style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.Bold,color=ink)}
 @Composable fun BoxCard(content:@Composable ColumnScope.()->Unit) {
     Column(Modifier.fillMaxWidth().padding(vertical=4.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
         HorizontalDivider(color=divider)
         Spacer(Modifier.height(4.dp))
         content()
+    }
+}
+@Composable private fun ActionRow(content:@Composable ()->Unit) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        if(maxWidth<340.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale>=1.3f)
+            Column(Modifier.fillMaxWidth(),verticalArrangement=Arrangement.spacedBy(2.dp)){content()}
+        else Row(horizontalArrangement=Arrangement.spacedBy(4.dp)){content()}
     }
 }
 @Composable fun Summary(label:String,value:String,detail:String){
@@ -111,7 +118,7 @@ typealias Commit = (suspend () -> Unit) -> Unit
     fun route(s:String){
         val p=Rules.parse(s)
         when(p.kind){
-            Rules.Kind.CANCEL,Rules.Kind.PROMISE->{tab=0;go("refund",message=s);draft=refundKey(p,s)}
+            Rules.Kind.CANCEL,Rules.Kind.PROMISE->{tab=0;go("refund",message=s);draft=if(p.reference.isNotBlank()) "refund-reference/"+digest(p.reference.uppercase(java.util.Locale.ROOT)) else uid()}
             Rules.Kind.CREDIT,Rules.Kind.REVIEW->{tab=2;go("credit",message=s)}
             else->{go("");say("No refund promise or incoming payment identified. You can add one manually.")}
         }
@@ -134,6 +141,27 @@ typealias Commit = (suspend () -> Unit) -> Unit
             val msg=importCsv(store,content);say(msg);deliver(ctx,msg)
         }
     }
+    val textFile=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){ uri ->
+        if(uri!=null) scope.launch {
+            try {
+                val message=withContext(Dispatchers.IO){
+                    requireNotNull(ctx.contentResolver.openInputStream(uri)).bufferedReader().use { reader ->
+                        val buffer=CharArray(12001)
+                        var used=0
+                        while(used<buffer.size){
+                            val n=reader.read(buffer,used,buffer.size-used)
+                            if(n<0)break
+                            used+=n
+                        }
+                        require(used in 1..12000){"Choose a text file containing one message, up to 12,000 characters."}
+                        String(buffer,0,used)
+                    }
+                }
+                route(message)
+            } catch(e:CancellationException){throw e}
+              catch(e:Exception){say(e.message ?: "Could not read the text file. Paste its contents instead.")}
+        }
+    }
     BackHandler(form.isNotEmpty()){if(!busy)go("")}
     Scaffold(containerColor=paper,snackbarHost={SnackbarHost(snacks)},bottomBar={
         if(form.isEmpty()) Surface(color=paper,tonalElevation=2.dp) {
@@ -154,14 +182,43 @@ typealias Commit = (suspend () -> Unit) -> Unit
                 Row(verticalAlignment=Alignment.CenterVertically){Text("DueBack",color=pine,fontSize=18.sp,fontWeight=FontWeight.Bold)
                     Spacer(Modifier.weight(1f)); if(form.isNotEmpty()) Link(if(form=="welcome") "Skip" else "Close"){if(!busy)go("")} else Link("Sources"){go("access")}
                 }
-                Text(when(form){"refund"->if(raw.isEmpty()) "Add refund" else "Review refund";"credit"->if(raw.isEmpty()) "Add payment" else "Review payment";"group"->"New group";"bill"->"Add a bill";"paste"->"Paste a message";"match"->"Allocate payment";"welcome"->"Set up DueBack";"access"->"Capture sources";"diagnostics"->"Capture diagnostics";"email"->"Import from Gmail";"feed"->"Activity";else->tabs[tab]},modifier=Modifier.semantics { heading() },style=MaterialTheme.typography.headlineLarge,fontWeight=FontWeight.SemiBold,color=ink)
+                Text(when(form){"refund"->if(raw.isEmpty()) "Add refund" else "Review refund";"credit"->if(raw.isEmpty()) "Add payment" else "Review payment";"group"->"New group";"bill"->"Add a bill";"paste"->"Paste a message";"match"->"Allocate payment";"welcome"->"Set up DueBack";"paymentDetail"->"Payment details";"refundDetail"->"Refund details";"access"->"Sources & connections";"diagnostics"->"Capture diagnostics";"email"->"Import from Gmail";"feed"->"Activity";else->tabs[tab]},modifier=Modifier.semantics { heading() },style=MaterialTheme.typography.headlineLarge,fontWeight=FontWeight.SemiBold,color=ink)
                 when(form){
-                    "paste"->{var message by rememberSaveable {mutableStateOf("")};Field("Cancellation, refund or payment text",message,{message=it},4);Action("Review message"){route(message)}}
+                    "paste"->{var message by rememberSaveable {mutableStateOf("")};Field("Cancellation, refund or payment text",message,{message=it},4);Action("Review message"){route(message)};Link("Open text file"){textFile.launch(arrayOf("text/plain"))}}
                     "refund"->RefundForm(raw){d->save { store.refund(d.copy(origin=if(raw.isBlank()) "Manual" else if(data.drafts.any { it.id==draft }) raw.lineSequence().lastOrNull { it.startsWith("Source: ") }?.removePrefix("Source: ") ?: "Notification" else "Shared text"),draft) }}
-                    "credit"->CreditForm(raw){c->save { val msg=store.ingest(c);say(msg);deliver(ctx,msg) }}
+                    "credit"->CreditForm(raw){c->save { val item=data.drafts.firstOrNull {it.id==draft && it.payment}
+                        val msg=store.db.withTransaction {
+                            val credit=if(item==null)c else c.copy(source=item.message.substringAfterLast("Source: "),sourceTime=item.sourceTime,sourceZone=item.sourceZone,confirmed=false,eventKey="review/"+item.id)
+                            store.ingest(credit).also {if(item!=null)store.q.dropDraft(item.id)}
+                        };say(msg);deliver(ctx,msg) }}
                     "group"->GroupForm {name,people->save {store.group(name,people)}}
                     "bill"->data.circles.find {it.id==selected}?.let {g->BillForm(g,data.people.filter {it.circle==g.id}){name,total,shares->save {store.bill(g,name,total,shares)}}}
                     "match"->data.credits.find {it.id==selected}?.let {c->MatchForm(data,c){d,n,split->save {store.allocate(c.id,d.id,n,split);deliver(ctx,"Payment allocated to "+data.label(d))}}}
+                    "paymentDetail"->data.credits.find {it.id==selected}?.let { c ->
+                        Summary(if(c.confirmed)"Confirmed credit" else "Awaiting confirmation",money(c.amount),c.source)
+                        Text(originalDate(c.sourceTime,c.sourceZone))
+                        if(data.allocations.none {it.credit==c.id}) Text("No allocation. This payment has not settled a balance.")
+                        if(c.payer.isNotBlank()) Text("From "+c.payer)
+                                    if(c.destination.isNotBlank()) Text("Received in "+c.destination)
+                                    c.reference?.let {Text("Transaction ID "+it)}
+                                    if(c.orderRef.isNotBlank()) Text("Order "+c.orderRef)
+                                    if(!c.confirmed){ Text(if(data.credits.any {it.id!=c.id && it.amount==c.amount}) "Another payment has this amount. Confirm only if your statement shows a separate credit." else "Check your statement before confirming this credit.");ActionRow{Link("Confirm credit"){save {store.review(c,true)}};Link("Dismiss"){save {store.review(c,false)}}} }
+                                    else if(data.free(c)>0){Text(money(data.free(c))+" available");Link(if(data.candidates(c).size>1)"Choose bill or refund" else "Allocate"){go("match",c.id)}}
+                                    data.allocations.filter {it.credit==c.id}.forEach {a->
+                                        Text(money(a.amount)+" → "+data.label(data.dues.first {it.id==a.due}));Text(a.reason,style=MaterialTheme.typography.bodySmall);Link("Undo match"){save {store.undo(a)}}
+                                    }
+                    }
+                    "refundDetail"->data.dues.find {it.id==selected}?.let { d ->
+                        Summary(d.name,money(data.left(d))+" outstanding","Promised "+money(d.amount))
+                        Text("Source · "+d.origin);Text(originalDate(d.sourceTime,d.sourceZone))
+                        Text("Confirmed receipts · "+money(d.amount-data.left(d)))
+                        if(d.date.isNotBlank()) Text("Expected "+d.date)
+                        if(d.orderRef.isNotBlank()) Text("Order "+d.orderRef)
+                        data.allocations.filter {it.due==d.id}.forEach {a ->
+                            val credit=data.credits.first {it.id==a.credit}
+                            BoxCard {Section(money(a.amount)+" via "+credit.source);Text(a.reason);Link("View payment"){go("paymentDetail",credit.id)}}
+                        }
+                    }
                     "welcome"->{
                         Text("Keep track of refunds you expect and repayments from people who owe you.")
                         Section("How money gets recorded")
@@ -169,7 +226,13 @@ typealias Commit = (suspend () -> Unit) -> Unit
                         Action("Choose capture sources"){go("access")}
                         Link("Continue with manual entry"){go("")}
                     }
-                    "access"->AccessForm(resumeTick,::say,{go("diagnostics")},{go("email")})
+                    "access"->AccessForm(resumeTick,::say,{go("diagnostics")},{go("email")}) {
+                        save {
+                            prefs(ctx).edit().putBoolean("paused",true).remove("eventTime").remove("eventSource").remove("outcome")
+                                .remove("processingFailed").remove("testResult").remove("probe").apply()
+                            store.deleteImports()
+                        }
+                    }
                     "diagnostics"->Diagnostics(resumeTick){go("access")}
                     "email"->GmailImport(store)
                     "feed"->{if(data.feed.isEmpty())Text("Your saved refunds, bills and matches will appear here.");data.feed.forEach {BoxCard{Text(it.text)}}}
@@ -178,15 +241,14 @@ typealias Commit = (suspend () -> Unit) -> Unit
                             0->{
                                 val refunds=data.dues.filter {it.bill.isEmpty()}
                                 Summary("Outstanding refunds",money(refunds.sumOf {data.left(it)}),money(refunds.sumOf {it.amount-data.left(it)})+" received")
-                                Row {Action("Add refund"){go("refund")};Link("Paste text"){go("paste")}}
-                                data.drafts.forEach { d->BoxCard {Text("Refund message to review");Text("Check the merchant and amount before saving.");Row{Link("Review"){go("refund",message=d.message);draft=d.id};Link("Dismiss"){save {store.db.withTransaction {store.q.dropDraft(d.id);store.note("Dismissed refund message")} }}}} }
+                                ActionRow {Action("Add refund"){go("refund")};Link("Paste text"){go("paste")}}
+                                data.drafts.filterNot { it.payment }.forEach { d->BoxCard {Text("Refund message to review");Text("Check the merchant and amount before saving.");ActionRow{Link("Review"){go("refund",message=d.message);draft=d.id};Link("Dismiss"){save {store.db.withTransaction {store.q.dropDraft(d.id);store.note("Dismissed refund message")} }}}} }
                                 if(refunds.isEmpty()) Text("Expecting money back? Add the promise here and track each credit as it arrives.")
                                 refunds.forEach {d->BoxCard{
                                     Section(d.name);val left=data.left(d)
                                     Text(if(left==0L)"Received in full" else if(d.date.isNotBlank() && d.date<LocalDate.now().toString()) "Overdue · "+money(left) else money(left)+" outstanding",color=pine)
                                     Text("Promised "+money(d.amount)+"   ·   Received "+money(d.amount-left));Text("Recorded via "+d.origin,style=MaterialTheme.typography.bodySmall)
-                                    listOf(d.orderRef,d.date,d.destination).filter {it.isNotBlank()}.takeIf {it.isNotEmpty()}?.let {Text(it.joinToString(" · "))}
-                                    data.allocations.filter {it.due==d.id}.forEach {a->val c=data.credits.first {it.id==a.credit};Text(money(a.amount)+" from "+c.source+" · "+c.destination.ifBlank {"Destination unspecified"});Text(a.reason,style=MaterialTheme.typography.bodySmall)}
+                                    Link("View refund"){go("refundDetail",d.id)}
                                 }}
                             }
                             1->{
@@ -210,24 +272,22 @@ typealias Commit = (suspend () -> Unit) -> Unit
                                 }}
                             }
                             2->{
-                                Summary("Money received",money(data.credits.filter {it.confirmed}.sumOf {it.amount}),money(data.credits.filter {it.confirmed}.sumOf {data.free(it)})+" available to allocate · "+data.credits.count {!it.confirmed}+" to review")
-                                Row{Action("Add credit"){go("credit")};Link("Paste text"){go("paste")}}
-                                Row{Link("Import CSV"){file.launch(arrayOf("text/*","application/csv","application/vnd.ms-excel","application/octet-stream"))};Link("Capture diagnostics"){go("diagnostics")}}
+                                Summary("Money received",money(data.credits.filter {it.confirmed}.sumOf {it.amount}),money(data.credits.filter {it.confirmed}.sumOf {data.free(it)})+" available to allocate · "+(data.credits.count {!it.confirmed}+data.drafts.count {it.payment})+" to review")
+                                ActionRow{Action("Add credit"){go("credit")};Link("Paste text"){go("paste")}}
+                                ActionRow{Link("Import CSV"){file.launch(arrayOf("text/*","application/csv","application/vnd.ms-excel","application/octet-stream"))};Link("Capture diagnostics"){go("diagnostics")}}
                                 var showCsv by rememberSaveable { mutableStateOf(false) }
                                 Link(if(showCsv)"Hide CSV format" else "CSV format"){showCsv=!showCsv}
                                 if(showCsv) Text("Use credit, or amount and type. Optional columns include utr, payer_id, destination and order_ref. Enter amounts in rupees.",style=MaterialTheme.typography.bodySmall)
-                                if(data.credits.isEmpty())Text("Incoming credits from any source appear here.")
+                                data.drafts.filter {it.payment}.forEach { d->BoxCard {
+                                    Section("Payment needs an amount");Text("Check the statement before saving.")
+                                    Link("Review payment"){go("credit",message=d.message);draft=d.id}
+                                    Link("Dismiss"){save { store.db.withTransaction {store.q.dropDraft(d.id);store.note("Dismissed payment draft")} }}
+                                }}
+                                if(data.credits.isEmpty() && data.drafts.none {it.payment})Text("Incoming credits from any source appear here.")
                                 data.credits.forEach {c->BoxCard{
                                     Section(money(c.amount)); Text("Recorded via "+c.source)
-                                    if(c.payer.isNotBlank()) Text("From "+c.payer)
-                                    if(c.destination.isNotBlank()) Text("Received in "+c.destination)
-                                    c.reference?.let {Text("Transaction ID "+it)}
-                                    if(c.orderRef.isNotBlank()) Text("Order "+c.orderRef)
-                                    if(!c.confirmed){ Text(if(data.credits.any {it.id!=c.id && it.amount==c.amount}) "Another payment has this amount. Confirm only if your statement shows a separate credit." else "Check your statement before confirming this credit.");Row{Link("Confirm credit"){save {store.review(c,true)}};Link("Dismiss"){save {store.review(c,false)}}} }
-                                    else if(data.free(c)>0){Text(money(data.free(c))+" available");Link(if(data.candidates(c).size>1)"Choose bill or refund" else "Allocate"){go("match",c.id)}}
-                                    data.allocations.filter {it.credit==c.id}.forEach {a->
-                                        Text(money(a.amount)+" → "+data.label(data.dues.first {it.id==a.due}));Text(a.reason,style=MaterialTheme.typography.bodySmall);Link("Undo match"){save {store.undo(a)}}
-                                    }
+                                    Text(if(c.confirmed) "Confirmed · "+money(data.free(c))+" available" else "Awaiting review")
+                                    Link("View payment"){go("paymentDetail",c.id)}
                                 }}
                             }
                         }
@@ -242,3 +302,10 @@ typealias Commit = (suspend () -> Unit) -> Unit
 }
 
 
+
+private fun originalDate(time:Long?,zone:String?):String {
+    if(time==null) return "Original date unavailable"
+    val location=runCatching {java.time.ZoneId.of(zone)}.getOrDefault(java.time.ZoneOffset.UTC)
+    return java.time.Instant.ofEpochMilli(time).atZone(location)
+        .format(java.time.format.DateTimeFormatter.ofPattern("d MMM uuuu, HH:mm z"))
+}

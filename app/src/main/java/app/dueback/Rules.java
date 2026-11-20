@@ -33,9 +33,13 @@ public final class Rules {
     }
     public static class Parsed {
         public Kind kind;
+        public boolean dateNeedsReview, amountNeedsReview;
         public String amount="", merchant="", reference="", order="", date="", destination="", payer="";
     }
     public static Parsed parse(String raw) {
+        return parse(raw, null, java.time.ZoneId.systemDefault());
+    }
+    public static Parsed parse(String raw, java.time.Instant original, java.time.ZoneId zone) {
         String t=raw.replace('\u00a0',' ').trim();
         String l=t.toLowerCase(Locale.ROOT);
         Parsed p=new Parsed();
@@ -45,6 +49,7 @@ public final class Rules {
         Matcher amounts = Pattern.compile(amountPattern, Pattern.CASE_INSENSITIVE).matcher(transactionLine);
         p.amount = amounts.find() ? amounts.group(1) : "";
         boolean ambiguousAmount = amounts.find();
+        p.amountNeedsReview = ambiguousAmount;
         boolean refund=l.contains("refund");
         boolean future=l.matches("(?s).*(?:initiated|promised|processing|will be|to be credited|expected|being processed|on its way|has been issued).*");
         boolean incoming=l.matches("(?s).*\\b(?:credited|received|deposited)\\b.*");
@@ -55,6 +60,7 @@ public final class Rules {
         else if(incoming && !future && !p.amount.isEmpty() &&
             (l.contains("credited") || l.contains("deposited") || l.matches("(?s).*(?:received\\s+(?:(?:inr|rs\\.?|₹)\\s*\\d|a payment|money)|(?:inr|rs\\.?|₹)\\s*[\\d,.]+\\s+(?:was\\s+)?received).*"))) p.kind=Kind.CREDIT;
         else if((refund || l.matches("(?s).*\\b(?:payment|transaction|transfer|credit)\\b.*")) && !p.amount.isEmpty()) p.kind=Kind.REVIEW;
+        else if(l.matches("(?s).*\\b(?:payment|transfer|refund)\\s+(?:received|credited|processed|initiated)\\b.*")) p.kind=Kind.REVIEW;
         else p.kind=Kind.IGNORE;
         if (p.kind == Kind.CREDIT && (ambiguousAmount || l.matches("(?s).*\\b(?:pending|scheduled|not yet|reversed)\\b.*"))) p.kind = Kind.REVIEW;
         p.reference=field(t,"\\b(?:utr|rrn|upi\\s*ref(?:erence)?|txn\\s*(?:id|ref)|transaction\\s*(?:id|ref))\\s*(?:no\\.?\\s*)?[:#= -]*([a-z0-9][a-z0-9-]{4,})\\b");
@@ -64,7 +70,13 @@ public final class Rules {
         p.date=field(t,"(?:by|expected(?:\\s+date)?|due(?:\\s+date)?|on)\\s*[:=]?\\s*(\\d{4}-\\d{2}-\\d{2})");
         if(p.date.isEmpty()){
             String days=field(t,"(?:within|in)\\s+(\\d{1,2})\\s+(?:calendar\\s+)?days?");
-            if(!days.isEmpty()) p.date=LocalDate.now().plusDays(Integer.parseInt(days)).toString();
+            if(!days.isEmpty()){
+                if(original==null) p.dateNeedsReview=true;
+                else p.date=original.atZone(zone).toLocalDate().plusDays(Integer.parseInt(days)).toString();
+            }
+            if(l.matches("(?s).*\\b(?:business|working)\\s+days?\\b.*")) {
+                p.date=""; p.dateNeedsReview=true;
+            }
         }
         if(p.date.isEmpty()){
             String numeric=field(t,"(?:by|expected|due|on)\\s*[:=]?\\s*(\\d{1,2}[/-]\\d{1,2}[/-]\\d{4})");

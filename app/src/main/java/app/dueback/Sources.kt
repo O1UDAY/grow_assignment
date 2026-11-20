@@ -43,34 +43,56 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
     }
     return remember(resumeTick,change) {
         val granted=listenerGranted(ctx)
-        val selected=sources.keys.filter {settings.getBoolean(it,false)}.toSet()
-        CaptureState(granted,selected,CapturePolicy.status(granted,selected.size,CaptureService.connected),
+        val selected=installedSources(ctx).keys.filter {settings.getBoolean(it,false)}.toSet()
+        CaptureState(granted,selected,when {
+            settings.getBoolean("paused",false) -> "Capture paused"
+            granted && selected.isNotEmpty() && CaptureService.connected && settings.getBoolean("processingFailed",false) -> "Processing failed"
+            else -> CapturePolicy.status(granted,selected.size,CaptureService.connected)
+        },
             settings.getLong("eventTime",0),settings.getString("eventSource",null),settings.getString("outcome",null))
     }
 }
-@Composable fun AccessForm(resumeTick:Int,say:(String)->Unit,diagnostics:()->Unit,email:()->Unit) {
+@Composable fun AccessForm(resumeTick:Int,say:(String)->Unit,diagnostics:()->Unit,email:()->Unit,delete:()->Unit) {
     val ctx=LocalContext.current
     val state=captureState(resumeTick)
     Section("Notification access · "+if(state.granted)"Enabled" else "Off")
     Text("Android can share the visible content of new notifications. DueBack processes only the apps you select. This grants no access to SMS history or your email inbox.")
     Section("Apps to listen to")
-    sources.forEach { (pkg,label) ->
+    val available=remember(resumeTick){installedSources(ctx)}
+    if(available.isEmpty()) Text("No supported apps installed. Share text or import a file instead.")
+    available.forEach { (pkg,label) ->
         val checked=pkg in state.selected
         Row(Modifier.fillMaxWidth().toggleable(checked,role=Role.Switch,onValueChange={
             prefs(ctx).edit().putBoolean(pkg,it).apply()
         }).heightIn(min=52.dp),verticalAlignment=Alignment.CenterVertically) {
-            Text(label,Modifier.weight(1f)); Switch(checked,null)
+            Column(Modifier.weight(1f)){Text(label);Text(pkg,style=MaterialTheme.typography.bodySmall)}; Switch(checked,null)
         }
         HorizontalDivider()
     }
     Text(state.status)
+    val paused=prefs(ctx).getBoolean("paused",false)
+    Link(if(paused) "Resume capture" else "Pause capture"){
+        prefs(ctx).edit().putBoolean("paused",!paused).apply()
+    }
+    if(state.granted && !CaptureService.connected) Link("Reconnect listener"){
+        runCatching { android.service.notification.NotificationListenerService.requestRebind(ComponentName(ctx,CaptureService::class.java)) }
+            .onSuccess { say("Reconnect requested. If still disconnected, turn DueBack access off and on in Android settings.") }
+            .onFailure {say("Turn DueBack access off and on in Android settings.")}
+    }
+    if(!state.granted && Build.VERSION.SDK_INT>=33) {
+        var help by remember {mutableStateOf(false)}
+        Link("Android blocked this setting?"){help=!help}
+        if(help) Text("For a trusted sideloaded APK, open Settings → Apps → DueBack → More → Allow restricted settings if available. Otherwise use manual entry or share text.")
+    }
     Action(if(state.granted)"Manage Android access" else "Open Android notification access"){
         runCatching { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
             .onFailure { say("Open Android Settings and search for Notification access, then select DueBack.") }
     }
     Link("View capture diagnostics",diagnostics)
+    Section("SMS history")
+    Text("DueBack does not read your SMS inbox. Share or paste one message, import a text file, or choose a CSV statement.")
     Section("Other inputs")
-    Text("Share selected SMS or email text to DueBack, or use Paste text. Under Payments, import a CSV or add a payment. Add expected refunds under Refunds.")
+    Text("Payments accepts CSV statements. Refunds and payments can always be entered manually.")
     Link("Gmail inbox import",email)
     Section("DueBack alerts")
     Text("Optional alerts let you know when your ledger changes.")
@@ -85,12 +107,21 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
         } else runCatching {ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,ctx.packageName))}
             .onFailure {say("Open DueBack in Android app settings to manage alerts.")}
     }
+    Section("Privacy")
+    var confirmDelete by remember { mutableStateOf(false) }
+    Link("Delete imported data"){confirmDelete=true}
+    if(confirmDelete) AlertDialog(onDismissRequest={confirmDelete=false},title={Text("Delete imports?")},
+        text={Text("Removes imported payments and refunds, their matches, drafts and activity history. Your groups, bills and manual entries stay. Capture will pause.")},
+        confirmButton={TextButton(onClick={confirmDelete=false;delete()}){Text("Delete imports")}},
+        dismissButton={TextButton(onClick={confirmDelete=false}){Text("Keep data")}})
+
 }
 
 @Composable fun Diagnostics(resumeTick:Int,manage:()->Unit) {
+    val ctx=LocalContext.current
     val state=captureState(resumeTick)
     BoxCard { Section("Android access");Text(if(state.granted)"Enabled" else "Off");Text(state.status) }
-    BoxCard { Section("Selected apps");Text(state.selected.mapNotNull {sources[it]}.joinToString().ifBlank {"None selected"}) }
+    BoxCard { Section("Selected apps");Text(state.selected.mapNotNull {installedSources(ctx)[it]}.joinToString().ifBlank {"None selected"}) }
     BoxCard {
         Section("Last selected-app notification")
         if(state.time==0L) Text("No event received yet.") else {
@@ -99,5 +130,29 @@ private data class CaptureState(val granted:Boolean, val selected:Set<String>, v
         }
     }
     Text("Only the source, time and result appear here. If no event arrives, check that the source app posts notifications with previews enabled.")
-    Action("Manage capture sources",manage)
+    Section("Listener test")
+    val settings=prefs(ctx)
+    var probeResult by remember {mutableStateOf(settings.getString("testResult",null))}
+    DisposableEffect(settings){
+        val listener=SharedPreferences.OnSharedPreferenceChangeListener { _,key -> if(key=="testResult") probeResult=settings.getString(key,null) }
+        settings.registerOnSharedPreferenceChangeListener(listener)
+        onDispose {settings.unregisterOnSharedPreferenceChangeListener(listener)}
+    }
+    Text("Posts a labelled test notification from DueBack. Nothing is added to your balance.")
+    Action("Run listener test"){
+        val manager=ctx.getSystemService(NotificationManager::class.java)
+        if(!state.granted || !CaptureService.connected) probeResult="Enable access and reconnect the listener first."
+        else if(manager==null || !manager.areNotificationsEnabled() || (Build.VERSION.SDK_INT>=33 && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=android.content.pm.PackageManager.PERMISSION_GRANTED))
+            probeResult="Enable DueBack alerts in Sources to post the test."
+        else {
+            val nonce=uid()
+            settings.edit().putString("probe",nonce).putString("testResult","Waiting for delivery. If this persists, check the test channel and reconnect.").apply()
+            manager.createNotificationChannel(android.app.NotificationChannel("test","Capture tests",NotificationManager.IMPORTANCE_DEFAULT))
+            manager.notify("capture-test",17,android.app.Notification.Builder(ctx,"test").setSmallIcon(android.R.drawable.stat_notify_more)
+                .setContentTitle("DueBack test data").setContentText("INR 12.34 credited").setTimeoutAfter(30000)
+                .addExtras(android.os.Bundle().apply {putString("dueback_probe",nonce)}).build())
+        }
+    }
+    probeResult?.let {Text(it)}
+    Link("Manage capture sources",manage)
 }
